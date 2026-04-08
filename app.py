@@ -6,6 +6,9 @@ import time
 import math
 import subprocess
 import importlib.util
+import tempfile
+import shutil
+import traceback
 from datetime import datetime
 
 import pandas as pd
@@ -160,6 +163,126 @@ def colored_input(label, widget_func, color_type, **kwargs):
 # =========================================================
 def has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
+
+
+def run_command_capture(cmd):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def first_existing_path(candidates):
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def get_chrome_binary_candidates():
+    return [
+        os.environ.get("CHROME_BINARY"),
+        os.environ.get("GOOGLE_CHROME_BIN"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+
+
+def get_chromedriver_candidates():
+    return [
+        os.environ.get("CHROMEDRIVER_PATH"),
+        shutil.which("chromedriver"),
+        "/usr/bin/chromedriver",
+        "/usr/local/bin/chromedriver",
+    ]
+
+
+def get_runtime_environment_summary():
+    chrome_path = first_existing_path(get_chrome_binary_candidates())
+    chromedriver_path = first_existing_path(get_chromedriver_candidates())
+
+    chrome_ver = "-"
+    chromedriver_ver = "-"
+
+    if chrome_path:
+        rc, out, err = run_command_capture([chrome_path, "--version"])
+        chrome_ver = out if rc == 0 and out else (err or "확인 실패")
+
+    if chromedriver_path:
+        rc, out, err = run_command_capture([chromedriver_path, "--version"])
+        chromedriver_ver = out if rc == 0 and out else (err or "확인 실패")
+
+    return {
+        "python": sys.executable,
+        "platform": sys.platform,
+        "chrome_path": chrome_path or "-",
+        "chrome_version": chrome_ver,
+        "chromedriver_path": chromedriver_path or "-",
+        "chromedriver_version": chromedriver_ver,
+    }
+
+
+def build_chrome_driver(logs):
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+
+    chrome_binary = first_existing_path(get_chrome_binary_candidates())
+    chromedriver_path = first_existing_path(get_chromedriver_candidates())
+
+    if not chrome_binary:
+        raise RuntimeError(
+            "크롬/크로미움 실행 파일을 찾지 못했습니다. "
+            "배포 서버에 chromium 또는 google-chrome 설치가 필요합니다."
+        )
+
+    options = Options()
+    options.binary_location = chrome_binary
+
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--lang=ko-KR")
+    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+    tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
+    tmp_data = tempfile.mkdtemp(prefix="chrome-data-")
+    options.add_argument(f"--user-data-dir={tmp_profile}")
+    options.add_argument(f"--data-path={tmp_data}")
+
+    add_log(logs, f"chrome binary: {chrome_binary}")
+    add_log(logs, f"chromedriver path: {chromedriver_path or 'selenium manager 사용'}")
+
+    try:
+        if chromedriver_path:
+            service = Service(executable_path=chromedriver_path)
+            driver = webdriver.Chrome(service=service, options=options)
+        else:
+            driver = webdriver.Chrome(options=options)
+
+        driver.set_page_load_timeout(40)
+        driver.implicitly_wait(2)
+        return driver
+    except Exception:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+        shutil.rmtree(tmp_data, ignore_errors=True)
+        raise
 
 
 def install_package_for_current_python(packages):
@@ -548,21 +671,10 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "logs": "실행 파이썬: {0}\nselenium 모듈 없음".format(sys.executable),
         }
 
-    if not has_module("webdriver_manager"):
-        return {
-            "status": "error",
-            "message": "현재 실행 중인 Python에 webdriver-manager가 설치되어 있지 않습니다.",
-            "logs": "실행 파이썬: {0}\nwebdriver_manager 모듈 없음".format(sys.executable),
-        }
-
     try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.chrome.options import Options
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
-        from webdriver_manager.chrome import ChromeDriverManager
     except Exception as e:
         return {
             "status": "error",
@@ -572,14 +684,16 @@ def scrape_kepco_power_planner(user_id, user_pw):
 
     driver = None
     try:
-        options = Options()
-        options.add_argument("--start-maximized")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        env_info = get_runtime_environment_summary()
+        add_log(logs, "실행 파이썬: {0}".format(env_info["python"]))
+        add_log(logs, "플랫폼: {0}".format(env_info["platform"]))
+        add_log(logs, "chrome path: {0}".format(env_info["chrome_path"]))
+        add_log(logs, "chrome version: {0}".format(env_info["chrome_version"]))
+        add_log(logs, "chromedriver path: {0}".format(env_info["chromedriver_path"]))
+        add_log(logs, "chromedriver version: {0}".format(env_info["chromedriver_version"]))
 
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        wait = WebDriverWait(driver, 20)
+        driver = build_chrome_driver(logs)
+        wait = WebDriverWait(driver, 25)
 
         login_url = "https://pp.kepco.co.kr/intro.do"
         driver.get(login_url)
@@ -803,9 +917,14 @@ def scrape_kepco_power_planner(user_id, user_pw):
 
     except Exception as e:
         add_log(logs, "예외 발생: {0}".format(str(e)))
+        add_log(logs, traceback.format_exc())
+        help_msg = (
+            "자동화 중 오류 발생: {0}\n\n"
+            "배포 서버에서는 chromium/chromedriver 설치 상태와 버전 호환이 맞아야 합니다."
+        ).format(str(e))
         return {
             "status": "error",
-            "message": "자동화 중 오류 발생: {0}".format(str(e)),
+            "message": help_msg,
             "logs": "\n".join(logs),
         }
     finally:
@@ -1212,6 +1331,11 @@ with st.expander("실행 환경 확인", expanded=False):
     st.write("PDF 폰트:", font_info_debug["pdf_name"])
     st.write("그래프 폰트:", font_info_debug["mpl_name"])
     st.write("폰트 경로:", font_info_debug["font_path"] or "기본 폰트 사용")
+    env_info_debug = get_runtime_environment_summary()
+    st.write("Chrome 경로:", env_info_debug["chrome_path"])
+    st.write("Chrome 버전:", env_info_debug["chrome_version"])
+    st.write("ChromeDriver 경로:", env_info_debug["chromedriver_path"])
+    st.write("ChromeDriver 버전:", env_info_debug["chromedriver_version"])
 
     col_install_1, col_install_2, col_install_3, col_install_4 = st.columns(4)
 
@@ -1274,12 +1398,12 @@ with left:
         "manual",
         options=["수동 입력", "파워플래너 값 수동 반영", "Selenium 자동 값 추출"],
         horizontal=True,
-        index=2,
+        index=1,
     )
 
     if pp_mode == "Selenium 자동 값 추출":
         with st.expander("파워플래너 계정 정보 입력", expanded=True):
-            st.warning("보안정책, 사이트 구조 변경, 로딩 지연에 따라 실패할 수 있습니다.")
+            st.warning("보안정책, 사이트 구조 변경, 로딩 지연에 따라 실패할 수 있습니다. 배포 서버에서는 chromium/chromedriver가 설치되어 있어야 자동화가 동작합니다.")
             col1, col2 = st.columns(2)
 
             with col1:
