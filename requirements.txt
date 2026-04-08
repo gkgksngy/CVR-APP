@@ -1,8 +1,7 @@
 streamlit
 pandas
 plotly
-openpyxl
 reportlab
 matplotlib
+openpyxl
 selenium
-webdriver-manager
