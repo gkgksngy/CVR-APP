@@ -1506,7 +1506,7 @@ with left:
         "입력 방식",
         st.radio,
         "manual",
-        options=["수동 입력", "파워플래너 값 수동 반영", "파워플래너 자동반영"],
+        options=["수동 입력", "파워플래너  수동 반영", "파워플래너 자동반영"],
         horizontal=True,
         index=1,
     )
