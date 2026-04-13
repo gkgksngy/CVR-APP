@@ -12,6 +12,7 @@ import traceback
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 import plotly.express as px
 
@@ -65,6 +66,14 @@ DEFAULT_STATE = {
     "pp_contract_power_kw": 0.0,
     "pp_supply_voltage_text": "",
     "pp_yearly_bill_won": 0.0,
+    "pp_voltage_class": "",
+    "pp_auto_avg_base_kw": 0.0,
+    "pp_auto_off_peak_kw": 0.0,
+    "pp_auto_mid_peak_kw": 0.0,
+    "pp_auto_peak_kw": 0.0,
+    "pp_auto_off_ratio": 0.0,
+    "pp_auto_mid_ratio": 0.0,
+    "pp_auto_peak_ratio": 0.0,
 }
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
@@ -306,10 +315,42 @@ def parse_number(text):
 def parse_voltage_from_text(text):
     if not text:
         return 0.0
-    m = re.search(r"(\d+(?:\.\d+)?)\s*kV", str(text), re.IGNORECASE)
+    raw = str(text)
+    low_voltage_match = re.search(r"(220/380|380/220|380V|220V)", raw, re.IGNORECASE)
+    if low_voltage_match:
+        return 0.38
+    m = re.search(r"(\d+(?:\.\d+)?)\s*kV", raw, re.IGNORECASE)
     if m:
         return float(m.group(1))
     return 0.0
+
+
+def classify_voltage_from_contract_kind(contract_kind, supply_text=""):
+    raw = f"{contract_kind or ''} {supply_text or ''}".replace(" ", "")
+    if "저압" in raw or "220/380" in raw or "380V" in raw or "220V" in raw:
+        return "저압"
+    if "고압C" in raw or "345" in raw:
+        return "고압C"
+    if "고압B" in raw or "154" in raw:
+        return "고압B"
+    if "고압A" in raw or "22.9" in raw:
+        return "고압A"
+    return ""
+
+
+def primary_voltage_from_class(voltage_class, supply_text=""):
+    parsed = parse_voltage_from_text(supply_text)
+    if parsed > 0:
+        return parsed
+    if voltage_class == "저압":
+        return 0.38
+    if voltage_class == "고압A":
+        return 22.9
+    if voltage_class == "고압B":
+        return 154.0
+    if voltage_class == "고압C":
+        return 345.0
+    return 22.9
 
 
 def get_voltage_class(primary_kv):
@@ -317,14 +358,16 @@ def get_voltage_class(primary_kv):
         return "저압"
     if 3.3 <= primary_kv <= 66.0:
         return "고압A"
-    if abs(primary_kv - 154.0) < 5.0:
+    if 100.0 <= primary_kv < 300.0:
         return "고압B"
-    if primary_kv >= 345.0:
+    if primary_kv >= 300.0:
         return "고압C"
     return "고압A"
 
 
 def describe_voltage_class(voltage_class, primary_kv):
+    if voltage_class == "저압":
+        return "저압"
     if voltage_class == "고압A":
         return f"고압A ({primary_kv:.1f}kV)"
     if voltage_class == "고압B":
@@ -630,6 +673,129 @@ def add_page_number(canvas, doc):
     canvas.restoreState()
 
 
+
+# =========================================================
+# API 해석 보조 함수
+# =========================================================
+def create_requests_session_from_driver(driver):
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://pp.kepco.co.kr/",
+    })
+    for cookie in driver.get_cookies():
+        session.cookies.set(
+            cookie.get("name"),
+            cookie.get("value"),
+            domain=cookie.get("domain"),
+            path=cookie.get("path", "/"),
+        )
+    return session
+
+
+def fetch_json(session, url, logs, label):
+    try:
+        response = session.get(url, timeout=20)
+        response.raise_for_status()
+        add_log(logs, f"{label} 호출 성공")
+        return response.json()
+    except Exception as e:
+        add_log(logs, f"{label} 호출 실패: {e}")
+        return None
+
+
+def parse_hour_label_to_index(label):
+    m = re.search(r"(\d+)", str(label))
+    if not m:
+        return None
+    hour = int(m.group(1))
+    if hour == 24:
+        return 0
+    if 1 <= hour <= 23:
+        return hour
+    if 0 <= hour <= 23:
+        return hour
+    return None
+
+
+def build_hourly_map_from_rows(rows):
+    hourly = {}
+    if not isinstance(rows, list):
+        return hourly
+    for row in rows:
+        hour_idx = parse_hour_label_to_index(row.get("MR_HHMI") or row.get("MR_HHMI2"))
+        if hour_idx is None:
+            continue
+        hourly[hour_idx] = parse_number(row.get("F_AP_QT"))
+    return hourly
+
+
+def summarize_band_loads_from_hourly(hourly_map, season):
+    if not hourly_map:
+        return None
+    full_values = [hourly_map[h] for h in sorted(hourly_map) if hourly_map[h] > 0]
+    if not full_values:
+        return None
+    base_avg = sum(full_values) / len(full_values)
+
+    band_values = {"경부하": [], "중간부하": [], "최대부하": []}
+    for hour, value in hourly_map.items():
+        if value <= 0:
+            continue
+        label = hour_to_label(hour, season)
+        band_values[label].append(value)
+
+    band_avg = {}
+    for label in ["경부하", "중간부하", "최대부하"]:
+        vals = band_values[label]
+        band_avg[label] = sum(vals) / len(vals) if vals else base_avg
+
+    return {
+        "base_avg_kw": base_avg,
+        "off_peak_kw": band_avg["경부하"],
+        "mid_peak_kw": band_avg["중간부하"],
+        "peak_kw": band_avg["최대부하"],
+        "off_ratio": band_avg["경부하"] / base_avg if base_avg else 1.0,
+        "mid_ratio": band_avg["중간부하"] / base_avg if base_avg else 1.0,
+        "peak_ratio": band_avg["최대부하"] / base_avg if base_avg else 1.0,
+    }
+
+
+def sum_latest_12_months(rows):
+    parsed = []
+    for row in rows or []:
+        year = int(parse_number(row.get("MR_YEAR")))
+        month = int(parse_number(row.get("MR_MONTH")))
+        usage = parse_number(row.get("F_AP_QT"))
+        if year and month and usage > 0:
+            parsed.append({"year": year, "month": month, "usage": usage})
+    if not parsed:
+        return 0.0
+    parsed.sort(key=lambda x: (x["year"], x["month"]), reverse=True)
+    return sum(r["usage"] for r in parsed[:12])
+
+
+def extract_rates_from_contract_info(contract_info):
+    off_peak = 0.0
+    mid_peak = 0.0
+    peak = 0.0
+    basic_charge = 0.0
+    details = contract_info.get("details") if isinstance(contract_info, dict) else []
+    for item in details or []:
+        time_cd = str(item.get("TIME_CD", "")).strip()
+        if not basic_charge:
+            basic_charge = parse_number(item.get("BASE_BILL_UCOST"))
+        spring_rate = parse_number(item.get("SEASEN_1"))
+        if time_cd == "1":
+            off_peak = spring_rate
+        elif time_cd == "2":
+            mid_peak = spring_rate
+        elif time_cd == "3":
+            peak = spring_rate
+    return basic_charge, off_peak, mid_peak, peak
+
 # =========================================================
 # Selenium 보조 함수
 # =========================================================
@@ -661,6 +827,7 @@ def click_first(driver, selectors, logs, label):
 # =========================================================
 # 파워플래너 추출 함수
 # =========================================================
+
 def scrape_kepco_power_planner(user_id, user_pw):
     logs = []
 
@@ -698,7 +865,6 @@ def scrape_kepco_power_planner(user_id, user_pw):
         login_url = "https://pp.kepco.co.kr/intro.do"
         driver.get(login_url)
         add_log(logs, "로그인 페이지 접속")
-
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text']")))
 
         id_selectors = [
@@ -724,13 +890,8 @@ def scrape_kepco_power_planner(user_id, user_pw):
 
         id_box = find_first(driver, id_selectors)
         pw_box = find_first(driver, pw_selectors)
-
         if id_box is None or pw_box is None:
-            return {
-                "status": "error",
-                "message": "아이디 또는 비밀번호 입력창을 찾지 못했습니다.",
-                "logs": "\n".join(logs),
-            }
+            return {"status": "error", "message": "아이디 또는 비밀번호 입력창을 찾지 못했습니다.", "logs": "\n".join(logs)}
 
         id_box.clear()
         id_box.send_keys(user_id)
@@ -738,20 +899,21 @@ def scrape_kepco_power_planner(user_id, user_pw):
         pw_box.send_keys(user_pw)
         add_log(logs, "아이디/비밀번호 입력 완료")
 
-        login_clicked = click_first(driver, login_btn_selectors, logs, "로그인 버튼")
-        if not login_clicked:
-            return {
-                "status": "error",
-                "message": "로그인 버튼 selector를 찾지 못했습니다.",
-                "logs": "\n".join(logs),
-            }
+        if not click_first(driver, login_btn_selectors, logs, "로그인 버튼"):
+            return {"status": "error", "message": "로그인 버튼 selector를 찾지 못했습니다.", "logs": "\n".join(logs)}
 
         time.sleep(3)
+        session = create_requests_session_from_driver(driver)
 
-        if "logout" in driver.page_source.lower():
-            add_log(logs, "로그인 성공 추정")
-        else:
-            add_log(logs, "로그인 성공 여부 확실하지 않음")
+        for page_url in [
+            "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101",
+            "https://pp.kepco.co.kr/rs/rs0106.do?menu_id=O010206",
+            "https://pp.kepco.co.kr/rp/rp0103.do?menu_id=O010303",
+        ]:
+            try:
+                session.get(page_url, timeout=15)
+            except Exception:
+                pass
 
         result = {
             "contract_kind": "",
@@ -762,169 +924,88 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "off_peak_rate": 0.0,
             "mid_peak_rate": 0.0,
             "peak_rate": 0.0,
-            "primary_voltage_kv": 154.0,
+            "primary_voltage_kv": 22.9,
             "contract_power_kw": 0.0,
             "supply_voltage_text": "",
             "yearly_bill_won": 0.0,
+            "voltage_class": "",
+            "auto_avg_base_kw": 0.0,
+            "auto_off_peak_kw": 0.0,
+            "auto_mid_peak_kw": 0.0,
+            "auto_peak_kw": 0.0,
+            "auto_off_ratio": 0.0,
+            "auto_mid_ratio": 0.0,
+            "auto_peak_ratio": 0.0,
         }
 
-        smartview_url = "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101"
-        driver.get(smartview_url)
-        time.sleep(2)
-        add_log(logs, "스마트뷰 화면 이동")
+        contract_info = fetch_json(session, "https://pp.kepco.co.kr/rm/rm0101_contract_info.do", logs, "rm0101_contract_info.do") or {}
+        smart_summary = fetch_json(session, "https://pp.kepco.co.kr/rm/getRM0101.do", logs, "getRM0101.do") or {}
+        selected_period_rows = fetch_json(session, "https://pp.kepco.co.kr/rs/rs0106_chart.do", logs, "rs0106_chart.do")
+        selected_hour_rows = fetch_json(session, "https://pp.kepco.co.kr/rs/rs0101N_hour.do", logs, "rs0101N_hour.do")
+        monthly_pf_rows = fetch_json(session, "https://pp.kepco.co.kr/rp/rp0103_usage_pf_list.do", logs, "rp0103_usage_pf_list.do")
+        if monthly_pf_rows is None:
+            monthly_pf_rows = fetch_json(session, "https://pp.kepco.co.kr/rp/p0103_usage_pf_list.do", logs, "p0103_usage_pf_list.do")
+        if monthly_pf_rows is None:
+            monthly_pf_rows = []
 
-        smart_text = driver.find_element(By.TAG_NAME, "body").text
-        patterns = {
-            "contract_kind": r"적용전기요금\s*([^\n]+)",
-            "basic_charge_unit": r"기본요금단가\s*([\d,\.]+)\s*원",
-            "power_bill_kw": r"요금적용전력\s*([\d,\.]+)\s*kW",
-            "max_demand_kw": r"최대수요전력\s*([\d,\.]+)\s*kW",
-        }
+        contract_kind = (contract_info.get("CNTR_KND_NM") or smart_summary.get("CNTR_KND_NM") or "").strip()
+        result["contract_kind"] = contract_kind
+        result["contract_power_kw"] = parse_number(contract_info.get("CNTR_PWR")) or parse_number(smart_summary.get("CNTR_PWR"))
+        result["power_bill_kw"] = parse_number(smart_summary.get("JOJ_KW")) or parse_number(smart_summary.get("CNTR_PWR"))
+        result["max_demand_kw"] = parse_number(smart_summary.get("REAL_MAX_PWR")) or parse_number(smart_summary.get("MAX_PWR"))
 
-        for key, pattern in patterns.items():
-            m = re.search(pattern, smart_text)
-            if m:
-                if key == "contract_kind":
-                    result[key] = m.group(1).strip()
-                else:
-                    result[key] = parse_number(m.group(1))
-                add_log(logs, "{0} 추출 성공".format(key))
-            else:
-                add_log(logs, "{0} 추출 실패".format(key))
+        basic_charge_unit, off_peak_rate, mid_peak_rate, peak_rate = extract_rates_from_contract_info(contract_info)
+        result["basic_charge_unit"] = basic_charge_unit or parse_number(smart_summary.get("BASE_BILL_UCOST"))
+        result["off_peak_rate"] = off_peak_rate
+        result["mid_peak_rate"] = mid_peak_rate
+        result["peak_rate"] = peak_rate
 
-        try:
-            if "경부하" in smart_text and "중간부하" in smart_text and "최대부하" in smart_text:
-                lines = [x.strip() for x in smart_text.splitlines() if x.strip()]
-                joined = "\n".join(lines)
-                off_match = re.search(r"경부하\s*120\.8\s*120\.8\s*127\.9", joined)
-                mid_match = re.search(r"중간부하\s*173\.1\s*143\.2\s*173\.1", joined)
-                peak_match = re.search(r"최대부하\s*254\.4\s*173\.5\s*229\.3", joined)
-                if off_match:
-                    result["off_peak_rate"] = 120.8
-                if mid_match:
-                    result["mid_peak_rate"] = 143.2
-                if peak_match:
-                    result["peak_rate"] = 173.5
-                if result["off_peak_rate"] > 0 and result["mid_peak_rate"] > 0 and result["peak_rate"] > 0:
-                    add_log(logs, "스마트뷰 단가표 추출 성공")
-                else:
-                    add_log(logs, "스마트뷰 단가표 정규식 추출 실패")
-        except Exception:
-            add_log(logs, "스마트뷰 단가표 추출 중 예외")
+        voltage_class = classify_voltage_from_contract_kind(contract_kind, contract_info.get("SUPPLY_TEXT", ""))
+        if not voltage_class:
+            lhv = str(contract_info.get("LHV_CLCD") or smart_summary.get("LHV_CLCD") or "")
+            voltage_class = {"0": "저압", "1": "고압A", "2": "고압B", "3": "고압C"}.get(lhv, "")
+        result["voltage_class"] = voltage_class or get_voltage_class(result["primary_voltage_kv"])
+        result["primary_voltage_kv"] = primary_voltage_from_class(result["voltage_class"], contract_info.get("SUPPLY_TEXT", ""))
+        result["supply_voltage_text"] = describe_voltage_class(result["voltage_class"], result["primary_voltage_kv"])
 
-        customer_url = "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601"
-        driver.get(customer_url)
-        time.sleep(2)
-        add_log(logs, "고객정보 화면 이동")
-        customer_text = driver.find_element(By.TAG_NAME, "body").text
+        result["annual_usage_kwh"] = sum_latest_12_months(monthly_pf_rows)
+        result["yearly_bill_won"] = parse_number(smart_summary.get("PREDICT_TOTAL_CHARGE")) or parse_number(smart_summary.get("TOTAL_CHARGE"))
 
-        m = re.search(r"계약종별\s*([^\n]+)", customer_text)
-        if m:
-            result["contract_kind"] = m.group(1).strip()
-            add_log(logs, "고객정보 계약종별 추출 성공")
+        hourly_map = build_hourly_map_from_rows(selected_period_rows or [])
+        if not hourly_map:
+            hourly_map = build_hourly_map_from_rows(selected_hour_rows or [])
+        band_summary = summarize_band_loads_from_hourly(hourly_map, "봄·가을")
+        if band_summary:
+            result["auto_avg_base_kw"] = band_summary["base_avg_kw"]
+            result["auto_off_peak_kw"] = band_summary["off_peak_kw"]
+            result["auto_mid_peak_kw"] = band_summary["mid_peak_kw"]
+            result["auto_peak_kw"] = band_summary["peak_kw"]
+            result["auto_off_ratio"] = band_summary["off_ratio"]
+            result["auto_mid_ratio"] = band_summary["mid_ratio"]
+            result["auto_peak_ratio"] = band_summary["peak_ratio"]
+            add_log(logs, "시간대별 평균부하 자동 산출 성공")
 
-        m = re.search(r"계약전력\s*([\d,\.]+)\s*kw", customer_text, re.IGNORECASE)
-        if m:
-            result["contract_power_kw"] = parse_number(m.group(1))
-            add_log(logs, "고객정보 계약전력 추출 성공")
+        if result["annual_usage_kwh"] <= 0 and result["auto_avg_base_kw"] > 0:
+            result["annual_usage_kwh"] = result["auto_avg_base_kw"] * 24 * 365
 
-        m = re.search(r"공급방식\s*([^\n]+)", customer_text)
-        if m:
-            result["supply_voltage_text"] = m.group(1).strip()
-            kv = parse_voltage_from_text(result["supply_voltage_text"])
-            if kv > 0:
-                result["primary_voltage_kv"] = kv
-            add_log(logs, "고객정보 공급방식 추출 성공")
-
-        usage_url = "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204"
-        driver.get(usage_url)
-        time.sleep(3)
-        add_log(logs, "연도별 전력사용량 화면 이동")
-
-        usage_text = driver.find_element(By.TAG_NAME, "body").text
-        usage_rows = []
-        pattern_usage = re.compile(r"(20\d{2})년\s*([\d,\.]+)\s*([\d,\.]+)", re.MULTILINE)
-        for m in pattern_usage.finditer(usage_text):
-            usage_rows.append({
-                "year": int(m.group(1)),
-                "usage_kwh": parse_number(m.group(2)),
-                "max_kw": parse_number(m.group(3)),
-            })
-
-        if usage_rows:
-            latest_full = choose_latest_full_year(usage_rows)
-            if latest_full:
-                result["annual_usage_kwh"] = latest_full["usage_kwh"]
-                if result["max_demand_kw"] <= 0:
-                    result["max_demand_kw"] = latest_full["max_kw"]
-                add_log(logs, "연도별 전력사용량 추출 성공: {0}".format(latest_full))
-        else:
-            add_log(logs, "연도별 전력사용량 추출 실패")
-
-        bill_url = "https://pp.kepco.co.kr/cc/cc0104.do?menu_id=O010406"
-        driver.get(bill_url)
-        time.sleep(2)
-        add_log(logs, "연도별 청구요금 화면 이동")
-
-        bill_text = driver.find_element(By.TAG_NAME, "body").text
-        bill_rows = []
-        pattern_bill = re.compile(r"(20\d{2})년\s*([\d,\.]+)\s*([\d,\.]+)", re.MULTILINE)
-        for m in pattern_bill.finditer(bill_text):
-            bill_rows.append({
-                "year": int(m.group(1)),
-                "bill_won": parse_number(m.group(2)),
-                "usage_kwh": parse_number(m.group(3)),
-            })
-
-        if bill_rows:
-            latest_full_bill = choose_latest_full_year(bill_rows)
-            if latest_full_bill:
-                result["yearly_bill_won"] = latest_full_bill["bill_won"]
-                if result["annual_usage_kwh"] <= 0:
-                    result["annual_usage_kwh"] = latest_full_bill["usage_kwh"]
-                add_log(logs, "연도별 청구요금 추출 성공: {0}".format(latest_full_bill))
-        else:
-            add_log(logs, "연도별 청구요금 추출 실패")
-
-        if result["primary_voltage_kv"] <= 0:
-            result["primary_voltage_kv"] = 154.0
-
-        if result["off_peak_rate"] <= 0 or result["mid_peak_rate"] <= 0 or result["peak_rate"] <= 0:
-            voltage_class = get_voltage_class(result["primary_voltage_kv"])
-            fallback = safe_rate_table(voltage_class)
-            result["off_peak_rate"] = fallback["봄·가을"]["경부하"]
-            result["mid_peak_rate"] = fallback["봄·가을"]["중간부하"]
-            result["peak_rate"] = fallback["봄·가을"]["최대부하"]
-            add_log(logs, "단가표 fallback 적용")
+        if result["contract_power_kw"] <= 0 and result["power_bill_kw"] > 0:
+            result["contract_power_kw"] = result["power_bill_kw"]
+        if result["power_bill_kw"] <= 0 and result["max_demand_kw"] > 0:
+            result["power_bill_kw"] = result["max_demand_kw"]
 
         return {
             "status": "success",
             "message": "파워플래너 값 추출을 완료했습니다.",
             "logs": "\n".join(logs),
-            "contract_kind": result["contract_kind"],
-            "basic_charge_unit": result["basic_charge_unit"],
-            "power_bill_kw": result["power_bill_kw"],
-            "max_demand_kw": result["max_demand_kw"],
-            "annual_usage_kwh": result["annual_usage_kwh"],
-            "off_peak_rate": result["off_peak_rate"],
-            "mid_peak_rate": result["mid_peak_rate"],
-            "peak_rate": result["peak_rate"],
-            "primary_voltage_kv": result["primary_voltage_kv"],
-            "contract_power_kw": result["contract_power_kw"],
-            "supply_voltage_text": result["supply_voltage_text"],
-            "yearly_bill_won": result["yearly_bill_won"],
+            **result,
         }
 
     except Exception as e:
         add_log(logs, "예외 발생: {0}".format(str(e)))
         add_log(logs, traceback.format_exc())
-        help_msg = (
-            "자동화 중 오류 발생: {0}\n\n"
-            "배포 서버에서는 chromium/chromedriver 설치 상태와 버전 호환이 맞아야 합니다."
-        ).format(str(e))
         return {
             "status": "error",
-            "message": help_msg,
+            "message": "자동화 중 오류 발생: {0}".format(str(e)),
             "logs": "\n".join(logs),
         }
     finally:
@@ -1379,6 +1460,26 @@ with st.expander("실행 환경 확인", expanded=False):
                     st.error("matplotlib 설치 실패")
                 st.code("STDOUT:\n{0}\n\nSTDERR:\n{1}".format(out, err))
 
+
+st.markdown(
+    """
+    <style>
+    .pp-right-sticky {
+        position: sticky;
+        top: 72px;
+    }
+    @media (max-width: 980px) {
+        .pp-right-sticky {
+            position: static;
+            top: auto;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 left, right = st.columns([1.7, 1.0])
 
 
@@ -1434,6 +1535,14 @@ with left:
                             st.session_state["pp_contract_power_kw"] = result.get("contract_power_kw", 0.0)
                             st.session_state["pp_supply_voltage_text"] = result.get("supply_voltage_text", "")
                             st.session_state["pp_yearly_bill_won"] = result.get("yearly_bill_won", 0.0)
+                            st.session_state["pp_voltage_class"] = result.get("voltage_class", "")
+                            st.session_state["pp_auto_avg_base_kw"] = result.get("auto_avg_base_kw", 0.0)
+                            st.session_state["pp_auto_off_peak_kw"] = result.get("auto_off_peak_kw", 0.0)
+                            st.session_state["pp_auto_mid_peak_kw"] = result.get("auto_mid_peak_kw", 0.0)
+                            st.session_state["pp_auto_peak_kw"] = result.get("auto_peak_kw", 0.0)
+                            st.session_state["pp_auto_off_ratio"] = result.get("auto_off_ratio", 0.0)
+                            st.session_state["pp_auto_mid_ratio"] = result.get("auto_mid_ratio", 0.0)
+                            st.session_state["pp_auto_peak_ratio"] = result.get("auto_peak_ratio", 0.0)
                             st.success(result["message"])
                         else:
                             st.error(result["message"])
@@ -1541,9 +1650,10 @@ with left:
     avg_kw_from_annual = annual_kwh_to_avg_kw(st.session_state["pp_annual_usage_kwh"])
 
     if pp_loaded:
+        summary_avg_kw = st.session_state.get("pp_auto_avg_base_kw", 0.0) or avg_kw_from_annual
         st.success(
             "평균부하: {0:,.1f} kW / 계약종별: {1} / 공급방식: {2}".format(
-                avg_kw_from_annual,
+                summary_avg_kw,
                 st.session_state["pp_contract_kind"] or "-",
                 st.session_state.get("pp_supply_voltage_text", "-") or "-",
             )
@@ -1668,7 +1778,11 @@ with left:
     unit_mul = 1000.0 if load_unit == "MW" else 1.0
 
     if input_mode == "평균부하+비율 입력":
-        default_avg_kw = avg_kw_from_annual if pp_loaded and avg_kw_from_annual > 0 else 18000.0
+        default_avg_kw = (
+            st.session_state.get("pp_auto_avg_base_kw", 0.0)
+            if pp_loaded and st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0
+            else (avg_kw_from_annual if pp_loaded and avg_kw_from_annual > 0 else 18000.0)
+        )
         avg_base_input = colored_input(
             f"기준 평균부하({load_unit})",
             st.number_input,
@@ -1680,24 +1794,30 @@ with left:
         avg_base_kw = avg_base_input * unit_mul
 
         r1, r2, r3 = st.columns(3)
+        default_off_ratio = st.session_state.get("pp_auto_off_ratio", 0.92) if pp_loaded else 0.92
+        default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.00) if pp_loaded else 1.00
+        default_peak_ratio = st.session_state.get("pp_auto_peak_ratio", 1.10) if pp_loaded else 1.10
         with r1:
-            off_ratio = colored_input("경부하 비율", st.number_input, "manual", min_value=0.10, value=0.92, step=0.01)
+            off_ratio = colored_input("경부하 비율", st.number_input, "manual", min_value=0.10, value=float(default_off_ratio or 0.92), step=0.01)
         with r2:
-            mid_ratio = colored_input("중간부하 비율", st.number_input, "manual", min_value=0.10, value=1.00, step=0.01)
+            mid_ratio = colored_input("중간부하 비율", st.number_input, "manual", min_value=0.10, value=float(default_mid_ratio or 1.00), step=0.01)
         with r3:
-            peak_ratio = colored_input("최대부하 비율", st.number_input, "manual", min_value=0.10, value=1.10, step=0.01)
+            peak_ratio = colored_input("최대부하 비율", st.number_input, "manual", min_value=0.10, value=float(default_peak_ratio or 1.10), step=0.01)
 
         auto_loads = avg_kw_to_timeband_loads(avg_base_kw, off_ratio, mid_ratio, peak_ratio)
         off_peak_kw = auto_loads["경부하"]
         mid_peak_kw = auto_loads["중간부하"]
         peak_kw = auto_loads["최대부하"]
     else:
+        default_off_kw = st.session_state.get("pp_auto_off_peak_kw", 16000.0) if pp_loaded else 16000.0
+        default_mid_kw = st.session_state.get("pp_auto_mid_peak_kw", 18000.0) if pp_loaded else 18000.0
+        default_peak_kw = st.session_state.get("pp_auto_peak_kw", 20000.0) if pp_loaded else 20000.0
         off_peak_kw = colored_input(
             f"경부하 평균부하({load_unit})",
             st.number_input,
             "manual",
             min_value=0.0,
-            value=16000.0 / unit_mul,
+            value=float(default_off_kw / unit_mul),
             step=1.0 if load_unit == "MW" else 1000.0,
         ) * unit_mul
         mid_peak_kw = colored_input(
@@ -1705,7 +1825,7 @@ with left:
             st.number_input,
             "manual",
             min_value=0.0,
-            value=18000.0 / unit_mul,
+            value=float(default_mid_kw / unit_mul),
             step=1.0 if load_unit == "MW" else 1000.0,
         ) * unit_mul
         peak_kw = colored_input(
@@ -1713,7 +1833,7 @@ with left:
             st.number_input,
             "manual",
             min_value=0.0,
-            value=20000.0 / unit_mul,
+            value=float(default_peak_kw / unit_mul),
             step=1.0 if load_unit == "MW" else 1000.0,
         ) * unit_mul
 
@@ -1742,7 +1862,21 @@ loads_by_label = {
     "중간부하": mid_peak_kw,
     "최대부하": peak_kw,
 }
-rate_table = safe_rate_table(primary_voltage_class)
+if (
+    st.session_state["pp_loaded"]
+    and st.session_state["pp_off_peak_rate"] > 0
+    and st.session_state["pp_mid_peak_rate"] > 0
+    and st.session_state["pp_peak_rate"] > 0
+):
+    rate_table = {
+        season: {
+            "경부하": float(st.session_state["pp_off_peak_rate"]),
+            "중간부하": float(st.session_state["pp_mid_peak_rate"]),
+            "최대부하": float(st.session_state["pp_peak_rate"]),
+        }
+    }
+else:
+    rate_table = safe_rate_table(primary_voltage_class)
 tariff_voltage_class = primary_voltage_class
 
 rows = []
@@ -1894,6 +2028,7 @@ created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 # 우측 결과 섹션
 # =========================================================
 with right:
+    st.markdown('<div class="pp-right-sticky">', unsafe_allow_html=True)
     logo_col1, logo_col2, logo_col3 = st.columns([1, 1, 1])
     with logo_col2:
         try:
@@ -1936,12 +2071,21 @@ with right:
     if st.session_state["pp_loaded"]:
         st.markdown("### 파워플래너 반영값")
         st.write("- 계약종별: **{0}**".format(st.session_state["pp_contract_kind"] or "-"))
+        st.write("- 전압등급: **{0}**".format(st.session_state.get("pp_voltage_class", "-") or "-"))
         st.write("- 기본요금단가: **{0:,.1f} 원/kW**".format(st.session_state["pp_basic_charge_unit"]))
         st.write("- 요금적용전력: **{0:,.1f} kW**".format(st.session_state["pp_power_bill_kw"]))
         st.write("- 최대수요전력: **{0:,.1f} kW**".format(st.session_state["pp_max_demand_kw"]))
-        st.write("- 전년도 사용량: **{0:,.1f} kWh**".format(st.session_state["pp_annual_usage_kwh"]))
+        st.write("- 최근 12개월 사용량: **{0:,.1f} kWh**".format(st.session_state["pp_annual_usage_kwh"]))
         st.write("- 공급방식: **{0}**".format(st.session_state["pp_supply_voltage_text"] or "-"))
+        if st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0:
+            st.write("- 자동 산출 기준 평균부하: **{0:,.1f} kW**".format(st.session_state["pp_auto_avg_base_kw"]))
+            st.write("- 자동 산출 경/중/최 평균부하: **{0:,.1f} / {1:,.1f} / {2:,.1f} kW**".format(
+                st.session_state.get("pp_auto_off_peak_kw", 0.0),
+                st.session_state.get("pp_auto_mid_peak_kw", 0.0),
+                st.session_state.get("pp_auto_peak_kw", 0.0),
+            ))
 
+    st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
 st.subheader("그래프")
