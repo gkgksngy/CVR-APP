@@ -65,6 +65,7 @@ DEFAULT_STATE = {
     "pp_primary_voltage_kv": 154.0,
     "pp_contract_power_kw": 0.0,
     "pp_supply_voltage_text": "",
+    "pp_meter_read_day": 0,
     "pp_yearly_bill_won": 0.0,
     "pp_voltage_class": "",
     "pp_auto_avg_base_kw": 0.0,
@@ -1465,13 +1466,21 @@ st.markdown(
     """
     <style>
     .pp-right-sticky {
+        position: -webkit-sticky;
         position: sticky;
         top: 72px;
+        align-self: flex-start;
+        height: fit-content;
+        max-height: calc(100vh - 90px);
+        overflow-y: auto;
+        padding-right: 4px;
     }
     @media (max-width: 980px) {
         .pp-right-sticky {
             position: static;
             top: auto;
+            max-height: none;
+            overflow-y: visible;
         }
     }
     </style>
@@ -1497,12 +1506,12 @@ with left:
         "입력 방식",
         st.radio,
         "manual",
-        options=["수동 입력", "파워플래너 값 수동 반영", "Selenium 자동 값 추출"],
+        options=["수동 입력", "파워플래너 값 수동 반영", "파워플래너 자동반영"],
         horizontal=True,
         index=1,
     )
 
-    if pp_mode == "Selenium 자동 값 추출":
+    if pp_mode == "파워플래너 자동반영":
         with st.expander("파워플래너 계정 정보 입력", expanded=True):
             st.warning("보안정책, 사이트 구조 변경, 로딩 지연에 따라 실패할 수 있습니다. 배포 서버에서는 chromium/chromedriver가 설치되어 있어야 자동화가 동작합니다.")
             col1, col2 = st.columns(2)
@@ -1534,6 +1543,7 @@ with left:
                             st.session_state["pp_primary_voltage_kv"] = result.get("primary_voltage_kv", 154.0)
                             st.session_state["pp_contract_power_kw"] = result.get("contract_power_kw", 0.0)
                             st.session_state["pp_supply_voltage_text"] = result.get("supply_voltage_text", "")
+                            st.session_state["pp_meter_read_day"] = result.get("meter_read_day", 0)
                             st.session_state["pp_yearly_bill_won"] = result.get("yearly_bill_won", 0.0)
                             st.session_state["pp_voltage_class"] = result.get("voltage_class", "")
                             st.session_state["pp_auto_avg_base_kw"] = result.get("auto_avg_base_kw", 0.0)
@@ -2038,11 +2048,11 @@ with right:
 
     st.markdown("### 🎨 입력항목 색상 범례")
     st.markdown(
-        '<div style="background-color: #d4edda; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟩 연녹색: 파워플래너 정보 자동 적용</div>',
+        '<div style="background-color: #d4edda; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟩 연녹색: 파워플래너 자동반영</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div style="background-color: #fff3cd; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟨 연노랑: 자동 적용되나 수동 검증 권장</div>',
+        '<div style="background-color: #fff3cd; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟨 연노랑: 파워플래너 자동반영 후 수동 검증 권장</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -2077,6 +2087,7 @@ with right:
         st.write("- 최대수요전력: **{0:,.1f} kW**".format(st.session_state["pp_max_demand_kw"]))
         st.write("- 최근 12개월 사용량: **{0:,.1f} kWh**".format(st.session_state["pp_annual_usage_kwh"]))
         st.write("- 공급방식: **{0}**".format(st.session_state["pp_supply_voltage_text"] or "-"))
+        st.write("- 검침일: **{0}일**".format(int(st.session_state.get("pp_meter_read_day", 0)) if st.session_state.get("pp_meter_read_day", 0) else "-"))
         if st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0:
             st.write("- 자동 산출 기준 평균부하: **{0:,.1f} kW**".format(st.session_state["pp_auto_avg_base_kw"]))
             st.write("- 자동 산출 경/중/최 평균부하: **{0:,.1f} / {1:,.1f} / {2:,.1f} kW**".format(
