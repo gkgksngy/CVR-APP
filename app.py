@@ -715,18 +715,13 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
-        season_label_map = {"봄·가을": "Spring-Fall", "봄·가을": "Spring-Fall", "여름": "Summer", "겨울": "Winter"}
-        season_label = season_label_map.get(season, "Season")
-        chart_title = f"{season_label} Hourly Load Profile"
+        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
+        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
+        ax.set_title("")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
         if font_prop is not None:
-            ax.set_title(chart_title, fontsize=12, fontproperties=font_prop)
-            ax.set_xlabel("Hour", fontproperties=font_prop)
-            ax.set_ylabel("Load (kW)", fontproperties=font_prop)
             _apply_font_to_axis(ax, font_prop)
-        else:
-            ax.set_title(chart_title, fontsize=12)
-            ax.set_xlabel("Hour")
-            ax.set_ylabel("Load (kW)")
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -740,12 +735,15 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
         if font_info.get("mpl_name"):
             plt.rcParams["font.family"] = font_info["mpl_name"]
-        plot_df = tap_compare_df.sort_values(by="탭", ascending=False).reset_index(drop=True).copy()
+        plot_df = tap_compare_df.copy()
+        plot_df["탭"] = pd.to_numeric(plot_df["탭"], errors="coerce")
+        plot_df = plot_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
         fig, ax = plt.subplots(figsize=(10, 4.8))
-        x_labels = plot_df["탭"].astype(str)
+        x_labels = plot_df["탭"].astype(int).astype(str)
         y_vals = plot_df["평균 절감전력(kW)"]
         bars = ax.bar(x_labels, y_vals)
         ax.grid(True, axis="y", alpha=0.3)
+        ax.invert_xaxis()
 
         font_prop = None
         if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
@@ -753,16 +751,13 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
-        chart_title = "Tap Comparison"
+        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
+        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
+        ax.set_title("")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
         if font_prop is not None:
-            ax.set_title(chart_title, fontsize=12, fontproperties=font_prop)
-            ax.set_xlabel("Tap", fontproperties=font_prop)
-            ax.set_ylabel("Avg Saving (kW)", fontproperties=font_prop)
             _apply_font_to_axis(ax, font_prop)
-        else:
-            ax.set_title(chart_title, fontsize=12)
-            ax.set_xlabel("Tap")
-            ax.set_ylabel("Avg Saving (kW)")
 
         for rect, val in zip(bars, y_vals):
             label = "0" if float(val) == 0 else f"{float(val):.3f}"
@@ -2279,11 +2274,11 @@ with g1:
 with g2:
     tap_chart_df = tap_compare_df.copy()
     if not tap_chart_df.empty:
-        tap_chart_df = tap_chart_df.sort_values(by="탭", ascending=False).reset_index(drop=True)
-        tap_chart_df["탭표시"] = tap_chart_df["탭"].astype(str)
+        tap_chart_df["탭"] = pd.to_numeric(tap_chart_df["탭"], errors="coerce")
+        tap_chart_df = tap_chart_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
         fig_bar = go.Figure()
         fig_bar.add_bar(
-            x=tap_chart_df["탭표시"].tolist(),
+            x=tap_chart_df["탭"].tolist(),
             y=tap_chart_df["평균 절감전력(kW)"].tolist(),
             text=[f"{v:.3f}" if float(v) != 0 else "0" for v in tap_chart_df["평균 절감전력(kW)"].tolist()],
             textposition="outside",
@@ -2291,8 +2286,10 @@ with g2:
         fig_bar.update_layout(title="탭별 예상 절감전력 비교")
         fig_bar.update_xaxes(
             title_text="탭",
-            categoryorder="array",
-            categoryarray=tap_chart_df["탭표시"].tolist(),
+            autorange="reversed",
+            tickmode="array",
+            tickvals=tap_chart_df["탭"].tolist(),
+            ticktext=[str(int(v)) for v in tap_chart_df["탭"].tolist()],
         )
         fig_bar.update_yaxes(title_text="평균 절감전력(kW)")
         st.plotly_chart(fig_bar, use_container_width=True)
@@ -2307,7 +2304,11 @@ with st.expander("24시간 상세 결과", expanded=False):
     st.dataframe(hourly_df, use_container_width=True, hide_index=True)
 
 with st.expander("탭별 비교표", expanded=False):
-    st.dataframe(tap_compare_df, use_container_width=True, hide_index=True)
+    tap_table_df = tap_compare_df.copy()
+    if not tap_table_df.empty:
+        tap_table_df["탭"] = pd.to_numeric(tap_table_df["탭"], errors="coerce")
+        tap_table_df = tap_table_df.sort_values(by="탭", ascending=False).reset_index(drop=True)
+    st.dataframe(tap_table_df, use_container_width=True, hide_index=True)
 
 
 # =========================================================
