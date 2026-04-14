@@ -33,6 +33,7 @@ from reportlab.platypus import (
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
@@ -491,6 +492,9 @@ def choose_latest_full_year(rows):
     return sorted(rows, key=lambda x: int(x["year"]), reverse=True)[0]
 
 
+CURRENT_PDF_FONT_NAME = "Helvetica"
+
+
 def get_korean_font_info():
     candidates = [
         {
@@ -514,9 +518,19 @@ def get_korean_font_info():
             "path": "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
         },
         {
-            "pdf_name": "NotoSansCJK",
+            "pdf_name": "NanumGothicLinux",
+            "mpl_fallback_name": "NanumGothic",
+            "path": "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        },
+        {
+            "pdf_name": "NotoSansKR",
             "mpl_fallback_name": "Noto Sans CJK KR",
             "path": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        },
+        {
+            "pdf_name": "NotoSansKR",
+            "mpl_fallback_name": "Noto Sans CJK KR",
+            "path": "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
         },
     ]
 
@@ -524,29 +538,48 @@ def get_korean_font_info():
         font_path = item["path"]
         if os.path.exists(font_path):
             pdf_name = item["pdf_name"]
+            registered_ok = False
             try:
                 registered = pdfmetrics.getRegisteredFontNames()
                 if pdf_name not in registered:
                     pdfmetrics.registerFont(TTFont(pdf_name, font_path))
+                registered_ok = True
             except Exception:
-                pass
+                registered_ok = False
 
             try:
                 mpl_name = fm.FontProperties(fname=font_path).get_name()
             except Exception:
                 mpl_name = item["mpl_fallback_name"]
 
+            if registered_ok:
+                return {
+                    "pdf_name": pdf_name,
+                    "font_path": font_path,
+                    "mpl_name": mpl_name,
+                }
+
             return {
-                "pdf_name": pdf_name,
+                "pdf_name": "HYGothic-Medium",
                 "font_path": font_path,
                 "mpl_name": mpl_name,
             }
 
-    return {
-        "pdf_name": "Helvetica",
-        "font_path": None,
-        "mpl_name": "DejaVu Sans",
-    }
+    try:
+        registered = pdfmetrics.getRegisteredFontNames()
+        if "HYGothic-Medium" not in registered:
+            pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+        return {
+            "pdf_name": "HYGothic-Medium",
+            "font_path": None,
+            "mpl_name": "DejaVu Sans",
+        }
+    except Exception:
+        return {
+            "pdf_name": "Helvetica",
+            "font_path": None,
+            "mpl_name": "DejaVu Sans",
+        }
 
 
 def make_two_col_table(data, col_widths=None, font_name="Helvetica", font_size=9):
@@ -668,7 +701,10 @@ def split_even_rows(data):
 
 def add_page_number(canvas, doc):
     canvas.saveState()
-    canvas.setFont("Helvetica", 8)
+    try:
+        canvas.setFont(CURRENT_PDF_FONT_NAME, 8)
+    except Exception:
+        canvas.setFont("Helvetica", 8)
     page_num = canvas.getPageNumber()
     canvas.drawRightString(doc.pagesize[0] - 15 * mm, 10 * mm, f"{page_num}")
     canvas.restoreState()
@@ -1070,8 +1106,10 @@ def build_pdf_bytes_report(
     fig_bar_buf,
 ):
     buffer = io.BytesIO()
+    global CURRENT_PDF_FONT_NAME
     font_info = get_korean_font_info()
     font_name = font_info["pdf_name"]
+    CURRENT_PDF_FONT_NAME = font_name
 
     doc = SimpleDocTemplate(
         buffer,
@@ -1506,7 +1544,7 @@ with left:
         "입력 방식",
         st.radio,
         "manual",
-        options=["수동 입력", "파워플래너  수동 반영", "파워플래너 자동반영"],
+        options=["수동 입력", "파워플래너 값 수동 반영", "파워플래너 자동반영"],
         horizontal=True,
         index=1,
     )
@@ -1997,6 +2035,15 @@ for tap in [1, 2, 3, 4, 5]:
     })
 
 tap_compare_df = pd.DataFrame(tap_compare_rows)
+if not tap_compare_df.empty:
+    tap_compare_df = tap_compare_df[
+        (tap_compare_df["전압 저감률(%)"] >= 1.25) &
+        (tap_compare_df["전압 저감률(%)"] <= 5.00)
+    ].copy()
+    tap_compare_df = tap_compare_df.sort_values(
+        by=["절감률(%)", "전압 저감률(%)", "탭"],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
 
 # 요약 데이터프레임
 rate_summary_df = pd.DataFrame({
@@ -2119,14 +2166,21 @@ with g1:
     st.plotly_chart(fig_load, use_container_width=True)
 
 with g2:
-    fig_bar = px.bar(
-        tap_compare_df,
-        x="탭",
-        y="평균 절감전력(kW)",
-        text="평균 절감전력(kW)",
-        title="탭별 예상 절감전력 비교",
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
+    tap_chart_df = tap_compare_df.copy()
+    if not tap_chart_df.empty:
+        tap_chart_df["탭표시"] = tap_chart_df["탭"].astype(str)
+        fig_bar = px.bar(
+            tap_chart_df,
+            x="탭표시",
+            y="평균 절감전력(kW)",
+            text="평균 절감전력(kW)",
+            title="탭별 예상 절감전력 비교",
+            category_orders={"탭표시": tap_chart_df["탭표시"].tolist()},
+        )
+        fig_bar.update_xaxes(title_text="탭")
+        st.plotly_chart(fig_bar, use_container_width=True)
+    else:
+        st.info("표시할 탭별 비교 데이터가 없습니다.")
 
 st.divider()
 st.subheader("상세 데이터")
