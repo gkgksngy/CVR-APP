@@ -714,15 +714,16 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
+        chart_title = f"{season} Hourly Load Profile"
         if font_prop is not None:
-            ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12, fontproperties=font_prop)
-            ax.set_xlabel("시간", fontproperties=font_prop)
-            ax.set_ylabel("전력사용량(kW)", fontproperties=font_prop)
+            ax.set_title(chart_title, fontsize=12, fontproperties=font_prop)
+            ax.set_xlabel("Hour", fontproperties=font_prop)
+            ax.set_ylabel("Load (kW)", fontproperties=font_prop)
             _apply_font_to_axis(ax, font_prop)
         else:
-            ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12)
-            ax.set_xlabel("시간")
-            ax.set_ylabel("전력사용량(kW)")
+            ax.set_title(chart_title, fontsize=12)
+            ax.set_xlabel("Hour")
+            ax.set_ylabel("Load (kW)")
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -747,15 +748,16 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
+        chart_title = f"{site_name} Tap Comparison"
         if font_prop is not None:
-            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12, fontproperties=font_prop)
-            ax.set_xlabel("탭", fontproperties=font_prop)
-            ax.set_ylabel("평균 절감전력(kW)", fontproperties=font_prop)
+            ax.set_title(chart_title, fontsize=12, fontproperties=font_prop)
+            ax.set_xlabel("Tap", fontproperties=font_prop)
+            ax.set_ylabel("Avg Saving (kW)", fontproperties=font_prop)
             _apply_font_to_axis(ax, font_prop)
         else:
-            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12)
-            ax.set_xlabel("탭")
-            ax.set_ylabel("평균 절감전력(kW)")
+            ax.set_title(chart_title, fontsize=12)
+            ax.set_xlabel("Tap")
+            ax.set_ylabel("Avg Saving (kW)")
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -2070,6 +2072,22 @@ hourly_df = pd.DataFrame(hour_rows)
 max_compare_drop_pct = 7.5
 tap_compare_rows = []
 current_tap_int = int(current_tap)
+
+# 현재 탭(기준점)도 함께 표시
+base_compare_voltage = current_voltage_for_calc
+base_compare_row = {
+    "탭": current_tap_int,
+    "계산 기준 전압(V)": round(base_compare_voltage, 1),
+    "전압 저감률(%)": 0.0,
+    "절감률(%)": 0.0,
+    "평균 절감전력(kW)": 0.0,
+    "일 절감량(kWh)": 0.0,
+    "연 절감량(kWh)": 0.0,
+    "일 절감요금(원)": 0.0,
+    "연 절감요금(원)": 0.0,
+}
+tap_compare_rows.append(base_compare_row)
+
 for tap in range(max(current_tap_int - 1, 1), 0, -1):
     delta_steps = max(current_tap_int - int(tap), 0)
     tap_voltage_drop_pct = calc_tap_voltage_change(tap_step_percent, delta_steps)
@@ -2116,12 +2134,15 @@ for tap in range(max(current_tap_int - 1, 1), 0, -1):
 tap_compare_df = pd.DataFrame(tap_compare_rows)
 if not tap_compare_df.empty:
     tap_compare_df = tap_compare_df[
-        (tap_compare_df["전압 저감률(%)"] >= 1.25) &
-        (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct)
+        (tap_compare_df["전압 저감률(%)"] == 0.0) |
+        (
+            (tap_compare_df["전압 저감률(%)"] >= 1.25) &
+            (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct)
+        )
     ].copy()
     tap_compare_df = tap_compare_df.sort_values(
-        by=["전압 저감률(%)", "탭"],
-        ascending=[True, False]
+        by=["탭"],
+        ascending=[False]
     ).reset_index(drop=True)
 
 # 요약 데이터프레임
