@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -714,7 +715,9 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
-        chart_title = f"{season} Hourly Load Profile"
+        season_label_map = {"봄·가을": "Spring-Fall", "봄·가을": "Spring-Fall", "여름": "Summer", "겨울": "Winter"}
+        season_label = season_label_map.get(season, "Season")
+        chart_title = f"{season_label} Hourly Load Profile"
         if font_prop is not None:
             ax.set_title(chart_title, fontsize=12, fontproperties=font_prop)
             ax.set_xlabel("Hour", fontproperties=font_prop)
@@ -737,9 +740,11 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
         if font_info.get("mpl_name"):
             plt.rcParams["font.family"] = font_info["mpl_name"]
+        plot_df = tap_compare_df.sort_values(by="탭", ascending=False).reset_index(drop=True).copy()
         fig, ax = plt.subplots(figsize=(10, 4.8))
-        x_labels = tap_compare_df["탭"].astype(str)
-        ax.bar(x_labels, tap_compare_df["평균 절감전력(kW)"])
+        x_labels = plot_df["탭"].astype(str)
+        y_vals = plot_df["평균 절감전력(kW)"]
+        bars = ax.bar(x_labels, y_vals)
         ax.grid(True, axis="y", alpha=0.3)
 
         font_prop = None
@@ -748,7 +753,7 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
-        chart_title = f"{site_name} Tap Comparison"
+        chart_title = "Tap Comparison"
         if font_prop is not None:
             ax.set_title(chart_title, fontsize=12, fontproperties=font_prop)
             ax.set_xlabel("Tap", fontproperties=font_prop)
@@ -758,6 +763,10 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
             ax.set_title(chart_title, fontsize=12)
             ax.set_xlabel("Tap")
             ax.set_ylabel("Avg Saving (kW)")
+
+        for rect, val in zip(bars, y_vals):
+            label = "0" if float(val) == 0 else f"{float(val):.3f}"
+            ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(), label, ha="center", va="bottom", fontsize=8)
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -2134,12 +2143,14 @@ for tap in range(max(current_tap_int - 1, 1), 0, -1):
 tap_compare_df = pd.DataFrame(tap_compare_rows)
 if not tap_compare_df.empty:
     tap_compare_df = tap_compare_df[
+        (tap_compare_df["탭"] == current_tap_int) |
         (tap_compare_df["전압 저감률(%)"] == 0.0) |
         (
             (tap_compare_df["전압 저감률(%)"] >= 1.25) &
             (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct)
         )
     ].copy()
+    tap_compare_df = tap_compare_df.drop_duplicates(subset=["탭"], keep="first")
     tap_compare_df = tap_compare_df.sort_values(
         by=["탭"],
         ascending=[False]
@@ -2268,16 +2279,22 @@ with g1:
 with g2:
     tap_chart_df = tap_compare_df.copy()
     if not tap_chart_df.empty:
+        tap_chart_df = tap_chart_df.sort_values(by="탭", ascending=False).reset_index(drop=True)
         tap_chart_df["탭표시"] = tap_chart_df["탭"].astype(str)
-        fig_bar = px.bar(
-            tap_chart_df,
-            x="탭표시",
-            y="평균 절감전력(kW)",
-            text="평균 절감전력(kW)",
-            title="탭별 예상 절감전력 비교",
-            category_orders={"탭표시": tap_chart_df["탭표시"].tolist()},
+        fig_bar = go.Figure()
+        fig_bar.add_bar(
+            x=tap_chart_df["탭표시"].tolist(),
+            y=tap_chart_df["평균 절감전력(kW)"].tolist(),
+            text=[f"{v:.3f}" if float(v) != 0 else "0" for v in tap_chart_df["평균 절감전력(kW)"].tolist()],
+            textposition="outside",
         )
-        fig_bar.update_xaxes(title_text="탭")
+        fig_bar.update_layout(title="탭별 예상 절감전력 비교")
+        fig_bar.update_xaxes(
+            title_text="탭",
+            categoryorder="array",
+            categoryarray=tap_chart_df["탭표시"].tolist(),
+        )
+        fig_bar.update_yaxes(title_text="평균 절감전력(kW)")
         st.plotly_chart(fig_bar, use_container_width=True)
     else:
         st.info("표시할 탭별 비교 데이터가 없습니다.")
