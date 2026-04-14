@@ -565,6 +565,30 @@ def get_korean_font_info():
                 "mpl_name": mpl_name,
             }
 
+    preferred_font_files = []
+    try:
+        for font_path in fm.findSystemFonts(fontpaths=None, fontext="ttf") + fm.findSystemFonts(fontpaths=None, fontext="ttc") + fm.findSystemFonts(fontpaths=None, fontext="otf"):
+            name = os.path.basename(font_path).lower()
+            if any(key in name for key in ["notosanscjk", "notosanskr", "nanumgothic", "nanumbarungothic", "malgun", "applegothic"]):
+                preferred_font_files.append(font_path)
+    except Exception:
+        preferred_font_files = []
+
+    for font_path in preferred_font_files:
+        try:
+            pdf_name = os.path.splitext(os.path.basename(font_path))[0][:30] or "KoreanFont"
+            registered = pdfmetrics.getRegisteredFontNames()
+            if pdf_name not in registered:
+                pdfmetrics.registerFont(TTFont(pdf_name, font_path))
+            mpl_name = fm.FontProperties(fname=font_path).get_name()
+            return {
+                "pdf_name": pdf_name,
+                "font_path": font_path,
+                "mpl_name": mpl_name,
+            }
+        except Exception:
+            continue
+
     try:
         registered = pdfmetrics.getRegisteredFontNames()
         if "HYGothic-Medium" not in registered:
@@ -582,8 +606,35 @@ def get_korean_font_info():
         }
 
 
+def _wrap_table_data(data, font_name="Helvetica", font_size=9):
+    styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle(
+        "TableCellWrap",
+        parent=styles["Normal"],
+        fontName=font_name,
+        fontSize=font_size,
+        leading=max(font_size + 1.5, font_size * 1.15),
+        alignment=1,
+        wordWrap="CJK",
+    )
+    wrapped = []
+    for row in data:
+        wrapped_row = []
+        for cell in row:
+            if isinstance(cell, Paragraph):
+                wrapped_row.append(cell)
+            elif isinstance(cell, str):
+                safe = cell.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
+                wrapped_row.append(Paragraph(safe, cell_style))
+            else:
+                wrapped_row.append(cell)
+        wrapped.append(wrapped_row)
+    return wrapped
+
+
 def make_two_col_table(data, col_widths=None, font_name="Helvetica", font_size=9):
-    tbl = Table(data, colWidths=col_widths, repeatRows=1)
+    wrapped = _wrap_table_data(data, font_name=font_name, font_size=font_size)
+    tbl = Table(wrapped, colWidths=col_widths, repeatRows=1)
     tbl.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), font_name),
         ("FONTSIZE", (0, 0), (-1, -1), font_size),
@@ -598,7 +649,8 @@ def make_two_col_table(data, col_widths=None, font_name="Helvetica", font_size=9
 
 
 def make_long_table(data, col_widths=None, font_name="Helvetica", font_size=8):
-    tbl = LongTable(data, colWidths=col_widths, repeatRows=1)
+    wrapped = _wrap_table_data(data, font_name=font_name, font_size=font_size)
+    tbl = LongTable(wrapped, colWidths=col_widths, repeatRows=1)
     tbl.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), font_name),
         ("FONTSIZE", (0, 0), (-1, -1), font_size),
@@ -648,18 +700,29 @@ def _apply_font_to_axis(ax, font_prop):
 
 def create_matplotlib_line_chart(hourly_df, season, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
+        if font_info.get("mpl_name"):
+            plt.rcParams["font.family"] = font_info["mpl_name"]
         fig, ax = plt.subplots(figsize=(10, 4.8))
         ax.plot(hourly_df["시간번호"], hourly_df["전력사용량(kW)"], marker="o", linewidth=1.8)
-        ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12)
-        ax.set_xlabel("시간")
-        ax.set_ylabel("전력사용량(kW)")
         ax.set_xticks(list(range(24)))
         ax.set_xticklabels([f"{i:02d}" for i in range(24)], fontsize=8)
         ax.grid(True, alpha=0.3)
 
-        if font_info["font_path"] and os.path.exists(font_info["font_path"]):
+        font_prop = None
+        if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
             font_prop = fm.FontProperties(fname=font_info["font_path"])
+        elif font_info.get("mpl_name"):
+            font_prop = fm.FontProperties(family=font_info["mpl_name"])
+
+        if font_prop is not None:
+            ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12, fontproperties=font_prop)
+            ax.set_xlabel("시간", fontproperties=font_prop)
+            ax.set_ylabel("전력사용량(kW)", fontproperties=font_prop)
             _apply_font_to_axis(ax, font_prop)
+        else:
+            ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12)
+            ax.set_xlabel("시간")
+            ax.set_ylabel("전력사용량(kW)")
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -671,16 +734,28 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
 
 def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
+        if font_info.get("mpl_name"):
+            plt.rcParams["font.family"] = font_info["mpl_name"]
         fig, ax = plt.subplots(figsize=(10, 4.8))
-        ax.bar(tap_compare_df["탭"].astype(str), tap_compare_df["평균 절감전력(kW)"])
-        ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12)
-        ax.set_xlabel("탭")
-        ax.set_ylabel("평균 절감전력(kW)")
+        x_labels = tap_compare_df["탭"].astype(str)
+        ax.bar(x_labels, tap_compare_df["평균 절감전력(kW)"])
         ax.grid(True, axis="y", alpha=0.3)
 
-        if font_info["font_path"] and os.path.exists(font_info["font_path"]):
+        font_prop = None
+        if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
             font_prop = fm.FontProperties(fname=font_info["font_path"])
+        elif font_info.get("mpl_name"):
+            font_prop = fm.FontProperties(family=font_info["mpl_name"])
+
+        if font_prop is not None:
+            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12, fontproperties=font_prop)
+            ax.set_xlabel("탭", fontproperties=font_prop)
+            ax.set_ylabel("평균 절감전력(kW)", fontproperties=font_prop)
             _apply_font_to_axis(ax, font_prop)
+        else:
+            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12)
+            ax.set_xlabel("탭")
+            ax.set_ylabel("평균 절감전력(kW)")
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -1992,10 +2067,14 @@ for h in range(24):
 hourly_df = pd.DataFrame(hour_rows)
 
 # 탭별 비교표
+max_compare_drop_pct = 7.5
 tap_compare_rows = []
-for tap in [1, 2, 3, 4, 5]:
-    delta_steps = max(int(current_tap - tap), 0)
+current_tap_int = int(current_tap)
+for tap in range(max(current_tap_int - 1, 1), 0, -1):
+    delta_steps = max(current_tap_int - int(tap), 0)
     tap_voltage_drop_pct = calc_tap_voltage_change(tap_step_percent, delta_steps)
+    if tap_voltage_drop_pct < 1.25 or tap_voltage_drop_pct > max_compare_drop_pct:
+        continue
     tap_new_voltage = current_voltage_for_calc * (1 - tap_voltage_drop_pct / 100.0)
 
     tap_daily_saved_kwh = 0.0
@@ -2038,11 +2117,11 @@ tap_compare_df = pd.DataFrame(tap_compare_rows)
 if not tap_compare_df.empty:
     tap_compare_df = tap_compare_df[
         (tap_compare_df["전압 저감률(%)"] >= 1.25) &
-        (tap_compare_df["전압 저감률(%)"] <= 5.00)
+        (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct)
     ].copy()
     tap_compare_df = tap_compare_df.sort_values(
-        by=["절감률(%)", "전압 저감률(%)", "탭"],
-        ascending=[False, False, False]
+        by=["전압 저감률(%)", "탭"],
+        ascending=[True, False]
     ).reset_index(drop=True)
 
 # 요약 데이터프레임
