@@ -1895,27 +1895,38 @@ with left:
     holiday_count = colored_input("연 공휴일 수", st.number_input, "manual", min_value=0, value=15, step=1)
 
     st.markdown("### 평균 부하 입력")
+    auto_ratio_ready = (
+        pp_mode == "파워플래너 자동반영"
+        and pp_loaded
+        and st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0
+    )
+
     input_mode = colored_input(
         "입력 방식",
         st.radio,
         "manual",
-        options=["직접 입력", "평균부하+비율 입력"],
+        options=["직접 입력", "파워플래너 자동 산출"],
         horizontal=True,
-        index=1 if pp_loaded else 0,
+        index=1 if auto_ratio_ready else 0,
     )
     load_unit = colored_input("입력 단위", st.radio, "manual", options=["kW", "MW"], horizontal=True, index=1)
     unit_mul = 1000.0 if load_unit == "MW" else 1.0
 
-    if input_mode == "평균부하+비율 입력":
+    if input_mode == "파워플래너 자동 산출":
         default_avg_kw = (
             st.session_state.get("pp_auto_avg_base_kw", 0.0)
-            if pp_loaded and st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0
+            if auto_ratio_ready and st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0
             else (avg_kw_from_annual if pp_loaded and avg_kw_from_annual > 0 else 18000.0)
         )
+        ratio_color = "auto" if auto_ratio_ready else "manual"
+
+        if auto_ratio_ready:
+            st.caption("파워플래너 시간대 평균부하를 기준으로 자동 산출되며, 필요 시 직접 수정할 수 있습니다.")
+
         avg_base_input = colored_input(
             f"기준 평균부하({load_unit})",
             st.number_input,
-            "manual",
+            ratio_color,
             min_value=0.0,
             value=float(default_avg_kw / unit_mul),
             step=1.0 if load_unit == "MW" else 1000.0,
@@ -1923,15 +1934,37 @@ with left:
         avg_base_kw = avg_base_input * unit_mul
 
         r1, r2, r3 = st.columns(3)
-        default_off_ratio = st.session_state.get("pp_auto_off_ratio", 0.92) if pp_loaded else 0.92
-        default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.00) if pp_loaded else 1.00
-        default_peak_ratio = st.session_state.get("pp_auto_peak_ratio", 1.10) if pp_loaded else 1.10
+        default_off_ratio = st.session_state.get("pp_auto_off_ratio", 0.92) if auto_ratio_ready else 0.92
+        default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.00) if auto_ratio_ready else 1.00
+        default_peak_ratio = st.session_state.get("pp_auto_peak_ratio", 1.10) if auto_ratio_ready else 1.10
+
         with r1:
-            off_ratio = colored_input("경부하 비율", st.number_input, "manual", min_value=0.10, value=float(default_off_ratio or 0.92), step=0.01)
+            off_ratio = colored_input(
+                "경부하 비율",
+                st.number_input,
+                ratio_color,
+                min_value=0.10,
+                value=float(default_off_ratio or 0.92),
+                step=0.01,
+            )
         with r2:
-            mid_ratio = colored_input("중간부하 비율", st.number_input, "manual", min_value=0.10, value=float(default_mid_ratio or 1.00), step=0.01)
+            mid_ratio = colored_input(
+                "중간부하 비율",
+                st.number_input,
+                ratio_color,
+                min_value=0.10,
+                value=float(default_mid_ratio or 1.00),
+                step=0.01,
+            )
         with r3:
-            peak_ratio = colored_input("최대부하 비율", st.number_input, "manual", min_value=0.10, value=float(default_peak_ratio or 1.10), step=0.01)
+            peak_ratio = colored_input(
+                "최대부하 비율",
+                st.number_input,
+                ratio_color,
+                min_value=0.10,
+                value=float(default_peak_ratio or 1.10),
+                step=0.01,
+            )
 
         auto_loads = avg_kw_to_timeband_loads(avg_base_kw, off_ratio, mid_ratio, peak_ratio)
         off_peak_kw = auto_loads["경부하"]
@@ -2247,6 +2280,11 @@ with right:
                 st.session_state.get("pp_auto_off_peak_kw", 0.0),
                 st.session_state.get("pp_auto_mid_peak_kw", 0.0),
                 st.session_state.get("pp_auto_peak_kw", 0.0),
+            ))
+            st.write("- 자동 산출 경/중/최 비율: **{0:.2f} / {1:.2f} / {2:.2f}**".format(
+                st.session_state.get("pp_auto_off_ratio", 0.0),
+                st.session_state.get("pp_auto_mid_ratio", 0.0),
+                st.session_state.get("pp_auto_peak_ratio", 0.0),
             ))
 
     st.markdown("</div>", unsafe_allow_html=True)
