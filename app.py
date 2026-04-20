@@ -988,34 +988,53 @@ def parse_hour_value(hour_text):
 
 
 def extract_hourly_usage_map_from_tables(tables):
-    candidate = None
+    hourly = {}
     for df in tables:
         sig = table_signature(df)
-        if "사용량(kWh)" in sig and "최대수요(kW)" in sig and "시" in sig:
-            candidate = df.copy()
-            break
-    if candidate is None:
-        return {}
+        if "사용량(kWh)" not in sig or "시" not in sig:
+            continue
 
-    candidate = candidate.copy().fillna("")
-    candidate.columns = [normalize_space(c) for c in candidate.columns]
+        work = df.copy().fillna("")
+        work.columns = [normalize_space(c) for c in work.columns]
+        hour_idx = []
+        usage_idx = []
+        for idx, col in enumerate(work.columns):
+            ncol = normalize_space(col)
+            if ncol == "시" or ncol.startswith("시"):
+                hour_idx.append(idx)
+            if "사용량" in ncol and "kWh" in ncol:
+                usage_idx.append(idx)
 
-    hour_col = None
-    usage_col = None
-    for col in candidate.columns:
-        ncol = normalize_space(col)
-        if ncol == "시" or ncol.startswith("시"):
-            hour_col = col
-        if "사용량" in ncol and "kWh" in ncol and usage_col is None:
-            usage_col = col
+        if not hour_idx or not usage_idx:
+            continue
 
-    if hour_col is None or usage_col is None:
-        return {}
+        for _, row in work.iterrows():
+            values = [normalize_space(v) for v in row.tolist()]
+            for hi in hour_idx:
+                if hi >= len(values):
+                    continue
+                hour = parse_hour_value(values[hi])
+                if hour is None:
+                    continue
+                candidate_usage = 0.0
+                for ui in usage_idx:
+                    if ui <= hi or ui >= len(values):
+                        continue
+                    num = parse_number(values[ui])
+                    if num > 0:
+                        candidate_usage = num
+                        break
+                if candidate_usage > 0:
+                    hourly[hour] = candidate_usage
+    return hourly
 
+
+def extract_hourly_usage_map_from_text(text):
     hourly = {}
-    for _, row in candidate.iterrows():
-        hour = parse_hour_value(row.get(hour_col, ""))
-        usage = parse_number(row.get(usage_col, 0))
+    raw = str(text or "")
+    for m in re.finditer(r"(?:^|\n)\s*(\d{2})\s+([0-9,]+(?:\.\d+)?)", raw, re.MULTILINE):
+        hour = parse_hour_value(m.group(1))
+        usage = parse_number(m.group(2))
         if hour is None or usage <= 0:
             continue
         hourly[hour] = usage
@@ -1066,7 +1085,29 @@ def extract_latest_12_months_usage_from_tables(tables):
     return 0.0
 
 
+def extract_latest_12_months_usage_from_text(text):
+    raw = str(text or "")
+    monthly = []
+    for m in re.finditer(r"(\d{1,2})월(?:\([^\)]*\))?\s+([0-9,]+(?:\.\d+)?)", raw):
+        month = int(m.group(1))
+        usage = parse_number(m.group(2))
+        if usage > 0:
+            monthly.append((month, usage))
+    if monthly:
+        dedup = {}
+        for month, usage in monthly:
+            dedup[month] = max(dedup.get(month, 0.0), usage)
+        rows = sorted(dedup.items(), key=lambda x: x[0], reverse=True)
+        return sum(v for _, v in rows[:12])
+
+    m = re.search(r"사용량합계\s*(?:\(kWh\))?\s*([0-9,]+(?:\.\d+)?)", raw)
+    if m:
+        return parse_number(m.group(1))
+    return 0.0
+
+
 def extract_yearly_usage_from_tables(tables):
+    rows = []
     for df in tables:
         sig = table_signature(df)
         if "연도" in sig and "사용량(kWh)" in sig:
@@ -1081,7 +1122,6 @@ def extract_yearly_usage_from_tables(tables):
                 if "사용량" in ncol and "kWh" in ncol:
                     usage_col = col
             if year_col and usage_col:
-                rows = []
                 for _, row in work.iterrows():
                     year_text = normalize_space(row.get(year_col, ""))
                     m = re.search(r"(20\d{2})", year_text)
@@ -1091,9 +1131,27 @@ def extract_yearly_usage_from_tables(tables):
                     usage = parse_number(row.get(usage_col, 0))
                     if usage > 0:
                         rows.append((year, usage))
-                rows.sort(key=lambda x: x[0], reverse=True)
-                if rows:
-                    return rows[0][1]
+    if rows:
+        now_year = datetime.now().year
+        full_years = [(y, v) for y, v in rows if y < now_year]
+        target = sorted(full_years if full_years else rows, key=lambda x: x[0], reverse=True)[0]
+        return target[1]
+    return 0.0
+
+
+def extract_yearly_usage_from_text(text):
+    rows = []
+    raw = str(text or "")
+    for m in re.finditer(r"(20\d{2})년\s+([0-9,]+(?:\.\d+)?)", raw):
+        year = int(m.group(1))
+        usage = parse_number(m.group(2))
+        if usage > 0:
+            rows.append((year, usage))
+    if rows:
+        now_year = datetime.now().year
+        full_years = [(y, v) for y, v in rows if y < now_year]
+        target = sorted(full_years if full_years else rows, key=lambda x: x[0], reverse=True)[0]
+        return target[1]
     return 0.0
 
 
@@ -1101,21 +1159,34 @@ def extract_max_demand_from_tables(tables):
     candidates = []
     for df in tables:
         sig = table_signature(df)
-        if "최대수요(kW)" not in sig:
+        if "최대수요" not in sig:
             continue
         work = df.copy().fillna("")
         work.columns = [normalize_space(c) for c in work.columns]
-        md_col = None
-        for col in work.columns:
-            if "최대수요" in normalize_space(col) and "kW" in normalize_space(col):
-                md_col = col
-                break
-        if md_col:
+        md_cols = [col for col in work.columns if "최대수요" in normalize_space(col) and "kW" in normalize_space(col)]
+        for md_col in md_cols:
             for v in work[md_col].tolist():
                 num = parse_number(v)
                 if num > 0:
                     candidates.append(num)
     return max(candidates) if candidates else 0.0
+
+
+def extract_max_demand_from_text(text):
+    raw = str(text or "")
+    patterns = [
+        r"최대수요전력\s*[:：]?\s*([0-9,]+(?:\.\d+)?)\s*kW",
+        r"최대수요\s*\(kW\)\s*([0-9,]+(?:\.\d+)?)",
+        r"최대\s*\(kW\)\s*([0-9,]+(?:\.\d+)?)",
+        r"최대수요\s*([0-9,]+(?:\.\d+)?)\s*kW",
+    ]
+    values = []
+    for pattern in patterns:
+        for m in re.finditer(pattern, raw, re.IGNORECASE):
+            num = parse_number(m.group(1))
+            if num > 0:
+                values.append(num)
+    return max(values) if values else 0.0
 
 
 def visit_powerplanner_page(driver, wait, by, url, logs, label, ready_patterns=None):
@@ -1144,21 +1215,30 @@ def scrape_smartview_page(page, result, logs):
 
     contract_kind = pick_pair_value(pairs, ["적용전기요금", "계약종별"])
     if not contract_kind:
-        contract_kind = extract_first_regex(text, [r"적용전기요금\s*([^^\n]+)"])
+        contract_kind = extract_first_regex(
+            text,
+            [r"적용전기요금\s*([^\n]+)", r"적용전기요금\s*[:：]?\s*([^\n]+)"],
+        )
     if contract_kind:
         result["contract_kind"] = contract_kind
 
     basic_charge = pick_pair_value(pairs, ["기본요금단가"])
+    if not basic_charge:
+        basic_charge = extract_first_regex(text, [r"기본요금단가\s*[:：]?\s*([0-9,\.]+)\s*원"])
     if basic_charge:
-        result["basic_charge_unit"] = parse_number(basic_charge)
+        result["basic_charge_unit"] = max(result["basic_charge_unit"], parse_number(basic_charge))
 
     power_bill = pick_pair_value(pairs, ["요금적용전력"])
+    if not power_bill:
+        power_bill = extract_first_regex(text, [r"요금적용전력\s*[:：]?\s*([0-9,\.]+)\s*kW"])
     if power_bill:
-        result["power_bill_kw"] = parse_number(power_bill)
+        result["power_bill_kw"] = max(result["power_bill_kw"], parse_number(power_bill))
 
     max_demand = pick_pair_value(pairs, ["최대수요전력"])
+    if not max_demand:
+        max_demand = extract_first_regex(text, [r"최대수요전력\s*[:：]?\s*([0-9,\.]+)\s*kW"])
     if max_demand:
-        result["max_demand_kw"] = parse_number(max_demand)
+        result["max_demand_kw"] = max(result["max_demand_kw"], parse_number(max_demand))
 
     realtime_usage = extract_first_regex(
         text,
@@ -1225,6 +1305,8 @@ def scrape_customer_info_page(page, result, logs):
 def scrape_hourly_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별 사용량")
     hourly_map = extract_hourly_usage_map_from_tables(tables)
+    if len(hourly_map) < 6:
+        hourly_map = extract_hourly_usage_map_from_text(page["text"])
     if hourly_map:
         band_summary = summarize_band_loads_from_hourly(hourly_map, month_to_season(datetime.now().month))
         if not band_summary:
@@ -1239,14 +1321,14 @@ def scrape_hourly_usage_page(page, result, logs):
             result["auto_peak_ratio"] = band_summary["peak_ratio"]
             add_log(logs, f"시간대별 부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
 
-    md = extract_max_demand_from_tables(tables)
+    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
 
 
 def scrape_daily_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="일별 사용량")
-    md = extract_max_demand_from_tables(tables)
+    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
         add_log(logs, f"일별 사용량에서 최대수요 후보 반영: {md:,.1f} kW")
@@ -1255,11 +1337,13 @@ def scrape_daily_usage_page(page, result, logs):
 def scrape_monthly_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="월별 사용량")
     annual_usage = extract_latest_12_months_usage_from_tables(tables)
+    if annual_usage <= 0:
+        annual_usage = extract_latest_12_months_usage_from_text(page["text"])
     if annual_usage > 0:
         result["annual_usage_kwh"] = max(result["annual_usage_kwh"], annual_usage)
         add_log(logs, f"월별 사용량에서 최근 합계 반영: {annual_usage:,.1f} kWh")
 
-    md = extract_max_demand_from_tables(tables)
+    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
 
@@ -1267,11 +1351,13 @@ def scrape_monthly_usage_page(page, result, logs):
 def scrape_yearly_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="연도별 사용량")
     annual_usage = extract_yearly_usage_from_tables(tables)
+    if annual_usage <= 0:
+        annual_usage = extract_yearly_usage_from_text(page["text"])
     if annual_usage > 0 and result["annual_usage_kwh"] <= 0:
         result["annual_usage_kwh"] = annual_usage
         add_log(logs, f"연도별 사용량에서 최근 연간 사용량 반영: {annual_usage:,.1f} kWh")
 
-    md = extract_max_demand_from_tables(tables)
+    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
 
@@ -1282,10 +1368,14 @@ def scrape_realtime_charge_page(page, result, logs):
     pairs = extract_pairs_from_tables(tables)
 
     contract_kind = pick_pair_value(pairs, ["적용전기요금"])
+    if not contract_kind:
+        contract_kind = extract_first_regex(text, [r"적용전기요금\s*[:：]?\s*([^\n]+)"])
     if contract_kind:
         result["contract_kind"] = contract_kind
 
     basic_charge = pick_pair_value(pairs, ["기본요금"])
+    if not basic_charge:
+        basic_charge = extract_first_regex(text, [r"기본요금\s*[:：]?\s*([0-9,\.]+)\s*원"])
     if basic_charge and result["basic_charge_unit"] <= 0:
         result["basic_charge_unit"] = parse_number(basic_charge)
 
@@ -1314,42 +1404,6 @@ def scrape_timeband_charge_page(page, result, logs):
         result["mid_peak_rate"] = max(result["mid_peak_rate"], rates.get("mid_peak_rate", 0.0))
         result["peak_rate"] = max(result["peak_rate"], rates.get("peak_rate", 0.0))
         add_log(logs, "시간대별 요금 단가 해석 완료")
-
-
-
-
-def find_first(driver, selectors):
-    for by, selector in selectors:
-        try:
-            elems = driver.find_elements(by, selector)
-            for elem in elems:
-                try:
-                    if elem.is_displayed():
-                        return elem
-                except Exception:
-                    return elem
-        except Exception:
-            continue
-    return None
-
-
-def click_first(driver, selectors, logs=None, label="요소"):
-    for by, selector in selectors:
-        try:
-            elems = driver.find_elements(by, selector)
-            for elem in elems:
-                try:
-                    driver.execute_script("arguments[0].click();", elem)
-                    if logs is not None:
-                        add_log(logs, f"{label} 클릭 성공: {selector}")
-                    return True
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    if logs is not None:
-        add_log(logs, f"{label} 클릭 실패")
-    return False
 
 
 def scrape_kepco_power_planner(user_id, user_pw):
@@ -2386,15 +2440,20 @@ with left:
     unit_mul = 1000.0 if load_unit == "MW" else 1.0
 
     if input_mode == "파워플래너 자동 산출":
-        default_avg_kw = (
-            st.session_state.get("pp_auto_avg_base_kw", 0.0)
-            if auto_ratio_ready and st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0
-            else (avg_kw_from_annual if pp_loaded and avg_kw_from_annual > 0 else 18000.0)
-        )
-        ratio_color = "auto" if auto_ratio_ready else "manual"
+        ratio_color = "auto" if auto_ratio_ready else "verify"
 
         if auto_ratio_ready:
             st.caption("파워플래너 시간대 평균부하를 기준으로 자동 산출되며, 필요 시 직접 수정할 수 있습니다.")
+            default_avg_kw = st.session_state.get("pp_auto_avg_base_kw", 0.0)
+            default_off_ratio = st.session_state.get("pp_auto_off_ratio", 1.0)
+            default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.0)
+            default_peak_ratio = st.session_state.get("pp_auto_peak_ratio", 1.0)
+        else:
+            st.warning("파워플래너 시간대별 평균부하 자동 산출값이 없어 기본값을 넣지 않았습니다. 자동반영을 다시 실행하거나 직접 입력으로 전환해 주세요.")
+            default_avg_kw = avg_kw_from_annual if pp_loaded and avg_kw_from_annual > 0 else 0.0
+            default_off_ratio = 1.0
+            default_mid_ratio = 1.0
+            default_peak_ratio = 1.0
 
         avg_base_input = colored_input(
             f"기준 평균부하({load_unit})",
@@ -2402,22 +2461,18 @@ with left:
             ratio_color,
             min_value=0.0,
             value=float(default_avg_kw / unit_mul),
-            step=1.0 if load_unit == "MW" else 1000.0,
+            step=0.1 if load_unit == "MW" else 100.0,
         )
         avg_base_kw = avg_base_input * unit_mul
 
         r1, r2, r3 = st.columns(3)
-        default_off_ratio = st.session_state.get("pp_auto_off_ratio", 0.92) if auto_ratio_ready else 0.92
-        default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.00) if auto_ratio_ready else 1.00
-        default_peak_ratio = st.session_state.get("pp_auto_peak_ratio", 1.10) if auto_ratio_ready else 1.10
-
         with r1:
             off_ratio = colored_input(
                 "경부하 비율",
                 st.number_input,
                 ratio_color,
                 min_value=0.10,
-                value=float(default_off_ratio or 0.92),
+                value=float(default_off_ratio or 1.0),
                 step=0.01,
             )
         with r2:
@@ -2426,7 +2481,7 @@ with left:
                 st.number_input,
                 ratio_color,
                 min_value=0.10,
-                value=float(default_mid_ratio or 1.00),
+                value=float(default_mid_ratio or 1.0),
                 step=0.01,
             )
         with r3:
@@ -2435,7 +2490,7 @@ with left:
                 st.number_input,
                 ratio_color,
                 min_value=0.10,
-                value=float(default_peak_ratio or 1.10),
+                value=float(default_peak_ratio or 1.0),
                 step=0.01,
             )
 
@@ -2444,9 +2499,9 @@ with left:
         mid_peak_kw = auto_loads["중간부하"]
         peak_kw = auto_loads["최대부하"]
     else:
-        default_off_kw = st.session_state.get("pp_auto_off_peak_kw", 16000.0) if pp_loaded else 16000.0
-        default_mid_kw = st.session_state.get("pp_auto_mid_peak_kw", 18000.0) if pp_loaded else 18000.0
-        default_peak_kw = st.session_state.get("pp_auto_peak_kw", 20000.0) if pp_loaded else 20000.0
+        default_off_kw = st.session_state.get("pp_auto_off_peak_kw", 0.0) if pp_loaded else 0.0
+        default_mid_kw = st.session_state.get("pp_auto_mid_peak_kw", 0.0) if pp_loaded else 0.0
+        default_peak_kw = st.session_state.get("pp_auto_peak_kw", 0.0) if pp_loaded else 0.0
         off_peak_kw = colored_input(
             f"경부하 평균부하({load_unit})",
             st.number_input,
