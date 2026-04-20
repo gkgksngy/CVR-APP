@@ -1316,6 +1316,42 @@ def scrape_timeband_charge_page(page, result, logs):
         add_log(logs, "시간대별 요금 단가 해석 완료")
 
 
+
+
+def find_first(driver, selectors):
+    for by, selector in selectors:
+        try:
+            elems = driver.find_elements(by, selector)
+            for elem in elems:
+                try:
+                    if elem.is_displayed():
+                        return elem
+                except Exception:
+                    return elem
+        except Exception:
+            continue
+    return None
+
+
+def click_first(driver, selectors, logs=None, label="요소"):
+    for by, selector in selectors:
+        try:
+            elems = driver.find_elements(by, selector)
+            for elem in elems:
+                try:
+                    driver.execute_script("arguments[0].click();", elem)
+                    if logs is not None:
+                        add_log(logs, f"{label} 클릭 성공: {selector}")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if logs is not None:
+        add_log(logs, f"{label} 클릭 실패")
+    return False
+
+
 def scrape_kepco_power_planner(user_id, user_pw):
     logs = []
 
