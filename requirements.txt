@@ -6,3 +6,6 @@ plotly
 reportlab
 matplotlib
 openpyxl
+lxml
+html5lib
+beautifulsoup4
