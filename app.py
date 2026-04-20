@@ -793,158 +793,528 @@ def add_page_number(canvas, doc):
 
 
 # =========================================================
-# API 해석 보조 함수
+# 파워플래너 화면 해석 보조 함수
 # =========================================================
-def create_requests_session_from_driver(driver):
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://pp.kepco.co.kr/",
-    })
-    for cookie in driver.get_cookies():
-        session.cookies.set(
-            cookie.get("name"),
-            cookie.get("value"),
-            domain=cookie.get("domain"),
-            path=cookie.get("path", "/"),
-        )
-    return session
+def normalize_space(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def fetch_json(session, url, logs, label):
+def normalize_key(text):
+    return re.sub(r"\s+", "", str(text or "")).strip()
+
+
+def safe_read_html_tables(html, logs=None, label=""):
     try:
-        response = session.get(url, timeout=20)
-        response.raise_for_status()
-        add_log(logs, f"{label} 호출 성공")
-        return response.json()
+        return pd.read_html(io.StringIO(html))
     except Exception as e:
-        add_log(logs, f"{label} 호출 실패: {e}")
-        return None
+        if logs is not None and label:
+            add_log(logs, f"{label} 표 해석 실패: {e}")
+        return []
 
 
-def parse_hour_label_to_index(label):
-    m = re.search(r"(\d+)", str(label))
+def table_signature(df):
+    try:
+        parts = [" ".join([normalize_space(str(c)) for c in df.columns.tolist()])]
+        preview_rows = min(len(df), 8)
+        for i in range(preview_rows):
+            row = df.iloc[i].tolist()
+            parts.append(" ".join([normalize_space(str(v)) for v in row]))
+        return normalize_space(" ".join(parts))
+    except Exception:
+        return ""
+
+
+def find_table_by_keywords(tables, keywords):
+    normalized_keywords = [normalize_space(k) for k in keywords if k]
+    for df in tables:
+        signature = table_signature(df)
+        if all(k in signature for k in normalized_keywords):
+            return df.copy()
+    return None
+
+
+def flatten_table_pairs(df):
+    pairs = {}
+    if df is None or df.empty:
+        return pairs
+
+    try:
+        working = df.copy().fillna("")
+        working.columns = [normalize_space(c) for c in working.columns]
+        values = working.astype(str).values.tolist()
+        for row in values:
+            row = [normalize_space(v) for v in row]
+            if not any(row):
+                continue
+            for i in range(0, len(row) - 1, 2):
+                key = row[i]
+                val = row[i + 1]
+                if not key or not val:
+                    continue
+                if normalize_key(key) == normalize_key(val):
+                    continue
+                pairs[key] = val
+    except Exception:
+        return pairs
+
+    return pairs
+
+
+def extract_pairs_from_tables(tables):
+    pairs = {}
+    for df in tables:
+        pairs.update(flatten_table_pairs(df))
+    return pairs
+
+
+def pick_pair_value(pairs, patterns):
+    if not pairs:
+        return ""
+    items = list(pairs.items())
+    for pattern in patterns:
+        if isinstance(pattern, (list, tuple)):
+            need = [normalize_key(x) for x in pattern]
+            for key, value in items:
+                nkey = normalize_key(key)
+                if all(x in nkey for x in need):
+                    return str(value)
+        else:
+            need = normalize_key(pattern)
+            for key, value in items:
+                if need and need in normalize_key(key):
+                    return str(value)
+    return ""
+
+
+def extract_first_regex(text, patterns):
+    raw = str(text or "")
+    for pattern in patterns:
+        m = re.search(pattern, raw, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        if m:
+            return normalize_space(m.group(1))
+    return ""
+
+
+def month_to_season(month):
+    if month in [6, 7, 8]:
+        return "여름"
+    if month in [11, 12, 1, 2]:
+        return "겨울"
+    return "봄·가을"
+
+
+def extract_tariff_rates_from_tables(tables, season=None):
+    if not season:
+        season = month_to_season(datetime.now().month)
+
+    season_alias = {
+        "여름": ["여름", "여름철"],
+        "봄·가을": ["봄·가을", "봄/가을", "봄가을", "봄·가을철"],
+        "겨울": ["겨울", "겨울철"],
+    }
+
+    target_df = None
+    for df in tables:
+        sig = table_signature(df)
+        if all(x in sig for x in ["경부하", "중간부하", "최대부하"]):
+            target_df = df.copy()
+            break
+    if target_df is None:
+        return {}
+
+    target_df = target_df.copy().fillna("")
+    target_df.columns = [normalize_space(c) for c in target_df.columns]
+
+    basic_charge = 0.0
+    for col in target_df.columns:
+        if "기본요금" in col:
+            for v in target_df[col].tolist():
+                num = parse_number(v)
+                if num > 0:
+                    basic_charge = num
+                    break
+
+    season_col = None
+    for alias in season_alias.get(season, []):
+        for col in target_df.columns:
+            if alias in normalize_space(col):
+                season_col = col
+                break
+        if season_col:
+            break
+
+    if season_col is None:
+        for col in target_df.columns:
+            ncol = normalize_space(col)
+            if "봄" in ncol and "가을" in ncol:
+                season_col = col
+                break
+
+    time_col = None
+    for col in target_df.columns:
+        if "시간대" in normalize_space(col):
+            time_col = col
+            break
+    if time_col is None:
+        time_col = target_df.columns[1] if len(target_df.columns) > 1 else target_df.columns[0]
+
+    rates = {"basic_charge_unit": basic_charge, "off_peak_rate": 0.0, "mid_peak_rate": 0.0, "peak_rate": 0.0}
+    if season_col is None:
+        return rates
+
+    for _, row in target_df.iterrows():
+        time_name = normalize_space(row.get(time_col, ""))
+        rate = parse_number(row.get(season_col, 0))
+        if "경부하" in time_name:
+            rates["off_peak_rate"] = rate
+        elif "중간부하" in time_name:
+            rates["mid_peak_rate"] = rate
+        elif "최대부하" in time_name:
+            rates["peak_rate"] = rate
+
+    return rates
+
+
+def parse_hour_value(hour_text):
+    m = re.search(r"(\d{1,2})", str(hour_text or ""))
     if not m:
         return None
     hour = int(m.group(1))
     if hour == 24:
         return 0
-    if 1 <= hour <= 23:
-        return hour
     if 0 <= hour <= 23:
         return hour
     return None
 
 
-def build_hourly_map_from_rows(rows):
+def extract_hourly_usage_map_from_tables(tables):
+    candidate = None
+    for df in tables:
+        sig = table_signature(df)
+        if "사용량(kWh)" in sig and "최대수요(kW)" in sig and "시" in sig:
+            candidate = df.copy()
+            break
+    if candidate is None:
+        return {}
+
+    candidate = candidate.copy().fillna("")
+    candidate.columns = [normalize_space(c) for c in candidate.columns]
+
+    hour_col = None
+    usage_col = None
+    for col in candidate.columns:
+        ncol = normalize_space(col)
+        if ncol == "시" or ncol.startswith("시"):
+            hour_col = col
+        if "사용량" in ncol and "kWh" in ncol and usage_col is None:
+            usage_col = col
+
+    if hour_col is None or usage_col is None:
+        return {}
+
     hourly = {}
-    if not isinstance(rows, list):
-        return hourly
-    for row in rows:
-        hour_idx = parse_hour_label_to_index(row.get("MR_HHMI") or row.get("MR_HHMI2"))
-        if hour_idx is None:
+    for _, row in candidate.iterrows():
+        hour = parse_hour_value(row.get(hour_col, ""))
+        usage = parse_number(row.get(usage_col, 0))
+        if hour is None or usage <= 0:
             continue
-        hourly[hour_idx] = parse_number(row.get("F_AP_QT"))
+        hourly[hour] = usage
     return hourly
 
 
-def summarize_band_loads_from_hourly(hourly_map, season):
-    if not hourly_map:
-        return None
-    full_values = [hourly_map[h] for h in sorted(hourly_map) if hourly_map[h] > 0]
-    if not full_values:
-        return None
-    base_avg = sum(full_values) / len(full_values)
+def extract_latest_12_months_usage_from_tables(tables):
+    monthly_rows = []
 
-    band_values = {"경부하": [], "중간부하": [], "최대부하": []}
-    for hour, value in hourly_map.items():
-        if value <= 0:
+    for df in tables:
+        sig = table_signature(df)
+        if "당해(kWh)" in sig and "월" in sig:
+            work = df.copy().fillna("")
+            work.columns = [normalize_space(c) for c in work.columns]
+            month_col = None
+            usage_col = None
+            for col in work.columns:
+                ncol = normalize_space(col)
+                if ncol == "월" or "월" in ncol:
+                    month_col = col
+                if "당해" in ncol and "kWh" in ncol:
+                    usage_col = col
+            if month_col and usage_col:
+                for _, row in work.iterrows():
+                    month_text = normalize_space(row.get(month_col, ""))
+                    m = re.search(r"(\d{1,2})월", month_text)
+                    if not m:
+                        continue
+                    month = int(m.group(1))
+                    usage = parse_number(row.get(usage_col, 0))
+                    if usage > 0:
+                        monthly_rows.append((month, usage))
+                if monthly_rows:
+                    monthly_rows.sort(key=lambda x: x[0], reverse=True)
+                    return sum(v for _, v in monthly_rows[:12])
+
+    for df in tables:
+        sig = table_signature(df)
+        if "사용량합계" in sig and "kWh" in sig:
+            work = df.copy().fillna("")
+            work.columns = [normalize_space(c) for c in work.columns]
+            for col in work.columns:
+                if "사용량합계" in normalize_space(col):
+                    for v in work[col].tolist():
+                        num = parse_number(v)
+                        if num > 0:
+                            return num
+    return 0.0
+
+
+def extract_yearly_usage_from_tables(tables):
+    for df in tables:
+        sig = table_signature(df)
+        if "연도" in sig and "사용량(kWh)" in sig:
+            work = df.copy().fillna("")
+            work.columns = [normalize_space(c) for c in work.columns]
+            year_col = None
+            usage_col = None
+            for col in work.columns:
+                ncol = normalize_space(col)
+                if "연도" in ncol:
+                    year_col = col
+                if "사용량" in ncol and "kWh" in ncol:
+                    usage_col = col
+            if year_col and usage_col:
+                rows = []
+                for _, row in work.iterrows():
+                    year_text = normalize_space(row.get(year_col, ""))
+                    m = re.search(r"(20\d{2})", year_text)
+                    if not m:
+                        continue
+                    year = int(m.group(1))
+                    usage = parse_number(row.get(usage_col, 0))
+                    if usage > 0:
+                        rows.append((year, usage))
+                rows.sort(key=lambda x: x[0], reverse=True)
+                if rows:
+                    return rows[0][1]
+    return 0.0
+
+
+def extract_max_demand_from_tables(tables):
+    candidates = []
+    for df in tables:
+        sig = table_signature(df)
+        if "최대수요(kW)" not in sig:
             continue
-        label = hour_to_label(hour, season)
-        band_values[label].append(value)
-
-    band_avg = {}
-    for label in ["경부하", "중간부하", "최대부하"]:
-        vals = band_values[label]
-        band_avg[label] = sum(vals) / len(vals) if vals else base_avg
-
-    return {
-        "base_avg_kw": base_avg,
-        "off_peak_kw": band_avg["경부하"],
-        "mid_peak_kw": band_avg["중간부하"],
-        "peak_kw": band_avg["최대부하"],
-        "off_ratio": band_avg["경부하"] / base_avg if base_avg else 1.0,
-        "mid_ratio": band_avg["중간부하"] / base_avg if base_avg else 1.0,
-        "peak_ratio": band_avg["최대부하"] / base_avg if base_avg else 1.0,
-    }
+        work = df.copy().fillna("")
+        work.columns = [normalize_space(c) for c in work.columns]
+        md_col = None
+        for col in work.columns:
+            if "최대수요" in normalize_space(col) and "kW" in normalize_space(col):
+                md_col = col
+                break
+        if md_col:
+            for v in work[md_col].tolist():
+                num = parse_number(v)
+                if num > 0:
+                    candidates.append(num)
+    return max(candidates) if candidates else 0.0
 
 
-def sum_latest_12_months(rows):
-    parsed = []
-    for row in rows or []:
-        year = int(parse_number(row.get("MR_YEAR")))
-        month = int(parse_number(row.get("MR_MONTH")))
-        usage = parse_number(row.get("F_AP_QT"))
-        if year and month and usage > 0:
-            parsed.append({"year": year, "month": month, "usage": usage})
-    if not parsed:
-        return 0.0
-    parsed.sort(key=lambda x: (x["year"], x["month"]), reverse=True)
-    return sum(r["usage"] for r in parsed[:12])
+def visit_powerplanner_page(driver, wait, by, url, logs, label, ready_patterns=None):
+    driver.get(url)
+    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    wait.until(lambda d: len(d.find_elements(by.TAG_NAME, "body")) > 0)
+    time.sleep(1.2)
+
+    if ready_patterns:
+        body_text = driver.find_element(by.TAG_NAME, "body").text
+        for pattern in ready_patterns:
+            if pattern and pattern not in body_text:
+                add_log(logs, f"{label} 화면 로드 후 확인문구 미일치: {pattern}")
+                break
+
+    html = driver.page_source
+    text = driver.find_element(by.TAG_NAME, "body").text
+    add_log(logs, f"{label} 화면 접속 완료")
+    return {"url": url, "html": html, "text": text}
 
 
-def extract_rates_from_contract_info(contract_info):
-    off_peak = 0.0
-    mid_peak = 0.0
-    peak = 0.0
-    basic_charge = 0.0
-    details = contract_info.get("details") if isinstance(contract_info, dict) else []
-    for item in details or []:
-        time_cd = str(item.get("TIME_CD", "")).strip()
-        if not basic_charge:
-            basic_charge = parse_number(item.get("BASE_BILL_UCOST"))
-        spring_rate = parse_number(item.get("SEASEN_1"))
-        if time_cd == "1":
-            off_peak = spring_rate
-        elif time_cd == "2":
-            mid_peak = spring_rate
-        elif time_cd == "3":
-            peak = spring_rate
-    return basic_charge, off_peak, mid_peak, peak
+def scrape_smartview_page(page, result, logs):
+    text = page["text"]
+    tables = safe_read_html_tables(page["html"], logs=logs, label="스마트뷰")
+    pairs = extract_pairs_from_tables(tables)
 
-# =========================================================
-# Selenium 보조 함수
-# =========================================================
-def find_first(driver, selectors):
-    for by, selector in selectors:
-        try:
-            elems = driver.find_elements(by, selector)
-            if elems:
-                return elems[0]
-        except Exception:
-            continue
-    return None
+    contract_kind = pick_pair_value(pairs, ["적용전기요금", "계약종별"])
+    if not contract_kind:
+        contract_kind = extract_first_regex(text, [r"적용전기요금\s*([^^\n]+)"])
+    if contract_kind:
+        result["contract_kind"] = contract_kind
+
+    basic_charge = pick_pair_value(pairs, ["기본요금단가"])
+    if basic_charge:
+        result["basic_charge_unit"] = parse_number(basic_charge)
+
+    power_bill = pick_pair_value(pairs, ["요금적용전력"])
+    if power_bill:
+        result["power_bill_kw"] = parse_number(power_bill)
+
+    max_demand = pick_pair_value(pairs, ["최대수요전력"])
+    if max_demand:
+        result["max_demand_kw"] = parse_number(max_demand)
+
+    realtime_usage = extract_first_regex(
+        text,
+        [r"실시간사용량\s*([0-9,\.]+)\s*kWh", r"실시간 사용량\s*([0-9,\.]+)\s*kWh"],
+    )
+    if realtime_usage:
+        result["realtime_usage_kwh"] = parse_number(realtime_usage)
+
+    realtime_fee = extract_first_regex(
+        text,
+        [r"실시간요금\s*([0-9,\.]+)\s*원", r"실시간 요금은\s*([0-9,\.]+)\s*원"],
+    )
+    if realtime_fee:
+        result["yearly_bill_won"] = max(result.get("yearly_bill_won", 0.0), parse_number(realtime_fee))
+
+    current_season = month_to_season(datetime.now().month)
+    rates = extract_tariff_rates_from_tables(tables, season=current_season)
+    if rates:
+        if rates.get("basic_charge_unit", 0) > 0 and result["basic_charge_unit"] <= 0:
+            result["basic_charge_unit"] = rates["basic_charge_unit"]
+        result["off_peak_rate"] = max(result["off_peak_rate"], rates.get("off_peak_rate", 0.0))
+        result["mid_peak_rate"] = max(result["mid_peak_rate"], rates.get("mid_peak_rate", 0.0))
+        result["peak_rate"] = max(result["peak_rate"], rates.get("peak_rate", 0.0))
+
+    add_log(logs, "스마트뷰 요약값 해석 완료")
 
 
-def click_first(driver, selectors, logs, label):
-    for by, selector in selectors:
-        try:
-            elems = driver.find_elements(by, selector)
-            if elems:
-                driver.execute_script("arguments[0].click();", elems[0])
-                add_log(logs, "{0} 클릭 성공: {1}".format(label, selector))
-                return True
-        except Exception:
-            continue
-    add_log(logs, "{0} 클릭 실패".format(label))
-    return False
+def scrape_customer_info_page(page, result, logs):
+    text = page["text"]
+    tables = safe_read_html_tables(page["html"], logs=logs, label="고객정보")
+    pairs = extract_pairs_from_tables(tables)
+
+    contract_kind = pick_pair_value(pairs, ["계약종별"])
+    if contract_kind:
+        result["contract_kind"] = contract_kind
+
+    contract_power = pick_pair_value(pairs, ["계약전력"])
+    if contract_power:
+        result["contract_power_kw"] = parse_number(contract_power)
+
+    supply_text = pick_pair_value(pairs, ["공급방식"])
+    if supply_text:
+        result["supply_voltage_text"] = supply_text
+
+    meter_read_text = pick_pair_value(pairs, ["검침일"])
+    if meter_read_text:
+        m = re.search(r"(\d{1,2})", meter_read_text)
+        if m:
+            result["meter_read_day"] = int(m.group(1))
+
+    if not result["contract_kind"]:
+        result["contract_kind"] = extract_first_regex(text, [r"계약종별\s*([^\n]+)"])
+    if result["contract_power_kw"] <= 0:
+        result["contract_power_kw"] = parse_number(extract_first_regex(text, [r"계약전력\s*([0-9,\.]+\s*kw)"]))
+    if not result["supply_voltage_text"]:
+        result["supply_voltage_text"] = extract_first_regex(text, [r"공급방식\s*([^\n]+)"])
+
+    voltage_class = classify_voltage_from_contract_kind(result.get("contract_kind", ""), result.get("supply_voltage_text", ""))
+    result["voltage_class"] = voltage_class or result.get("voltage_class", "")
+    result["primary_voltage_kv"] = primary_voltage_from_class(result["voltage_class"], result.get("supply_voltage_text", ""))
+    add_log(logs, "고객정보 해석 완료")
 
 
-# =========================================================
-# 파워플래너 추출 함수
-# =========================================================
+def scrape_hourly_usage_page(page, result, logs):
+    tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별 사용량")
+    hourly_map = extract_hourly_usage_map_from_tables(tables)
+    if hourly_map:
+        band_summary = summarize_band_loads_from_hourly(hourly_map, month_to_season(datetime.now().month))
+        if not band_summary:
+            band_summary = summarize_band_loads_from_hourly(hourly_map, "봄·가을")
+        if band_summary:
+            result["auto_avg_base_kw"] = band_summary["base_avg_kw"]
+            result["auto_off_peak_kw"] = band_summary["off_peak_kw"]
+            result["auto_mid_peak_kw"] = band_summary["mid_peak_kw"]
+            result["auto_peak_kw"] = band_summary["peak_kw"]
+            result["auto_off_ratio"] = band_summary["off_ratio"]
+            result["auto_mid_ratio"] = band_summary["mid_ratio"]
+            result["auto_peak_ratio"] = band_summary["peak_ratio"]
+            add_log(logs, f"시간대별 부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
+
+    md = extract_max_demand_from_tables(tables)
+    if md > 0:
+        result["max_demand_kw"] = max(result["max_demand_kw"], md)
+
+
+def scrape_daily_usage_page(page, result, logs):
+    tables = safe_read_html_tables(page["html"], logs=logs, label="일별 사용량")
+    md = extract_max_demand_from_tables(tables)
+    if md > 0:
+        result["max_demand_kw"] = max(result["max_demand_kw"], md)
+        add_log(logs, f"일별 사용량에서 최대수요 후보 반영: {md:,.1f} kW")
+
+
+def scrape_monthly_usage_page(page, result, logs):
+    tables = safe_read_html_tables(page["html"], logs=logs, label="월별 사용량")
+    annual_usage = extract_latest_12_months_usage_from_tables(tables)
+    if annual_usage > 0:
+        result["annual_usage_kwh"] = max(result["annual_usage_kwh"], annual_usage)
+        add_log(logs, f"월별 사용량에서 최근 합계 반영: {annual_usage:,.1f} kWh")
+
+    md = extract_max_demand_from_tables(tables)
+    if md > 0:
+        result["max_demand_kw"] = max(result["max_demand_kw"], md)
+
+
+def scrape_yearly_usage_page(page, result, logs):
+    tables = safe_read_html_tables(page["html"], logs=logs, label="연도별 사용량")
+    annual_usage = extract_yearly_usage_from_tables(tables)
+    if annual_usage > 0 and result["annual_usage_kwh"] <= 0:
+        result["annual_usage_kwh"] = annual_usage
+        add_log(logs, f"연도별 사용량에서 최근 연간 사용량 반영: {annual_usage:,.1f} kWh")
+
+    md = extract_max_demand_from_tables(tables)
+    if md > 0:
+        result["max_demand_kw"] = max(result["max_demand_kw"], md)
+
+
+def scrape_realtime_charge_page(page, result, logs):
+    text = page["text"]
+    tables = safe_read_html_tables(page["html"], logs=logs, label="실시간·예상요금")
+    pairs = extract_pairs_from_tables(tables)
+
+    contract_kind = pick_pair_value(pairs, ["적용전기요금"])
+    if contract_kind:
+        result["contract_kind"] = contract_kind
+
+    basic_charge = pick_pair_value(pairs, ["기본요금"])
+    if basic_charge and result["basic_charge_unit"] <= 0:
+        result["basic_charge_unit"] = parse_number(basic_charge)
+
+    realtime_fee = extract_first_regex(text, [r"실시간 요금은\s*([0-9,\.]+)\s*원", r"실시간요금\s*([0-9,\.]+)\s*원"])
+    if realtime_fee:
+        result["yearly_bill_won"] = max(result["yearly_bill_won"], parse_number(realtime_fee))
+
+    current_season = month_to_season(datetime.now().month)
+    rates = extract_tariff_rates_from_tables(tables, season=current_season)
+    if rates:
+        result["off_peak_rate"] = max(result["off_peak_rate"], rates.get("off_peak_rate", 0.0))
+        result["mid_peak_rate"] = max(result["mid_peak_rate"], rates.get("mid_peak_rate", 0.0))
+        result["peak_rate"] = max(result["peak_rate"], rates.get("peak_rate", 0.0))
+        if result["basic_charge_unit"] <= 0:
+            result["basic_charge_unit"] = rates.get("basic_charge_unit", 0.0)
+
+    add_log(logs, "실시간·예상요금 해석 완료")
+
+
+def scrape_timeband_charge_page(page, result, logs):
+    tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별요금")
+    current_season = month_to_season(datetime.now().month)
+    rates = extract_tariff_rates_from_tables(tables, season=current_season)
+    if rates:
+        result["off_peak_rate"] = max(result["off_peak_rate"], rates.get("off_peak_rate", 0.0))
+        result["mid_peak_rate"] = max(result["mid_peak_rate"], rates.get("mid_peak_rate", 0.0))
+        result["peak_rate"] = max(result["peak_rate"], rates.get("peak_rate", 0.0))
+        add_log(logs, "시간대별 요금 단가 해석 완료")
+
 
 def scrape_kepco_power_planner(user_id, user_pw):
     logs = []
@@ -978,7 +1348,7 @@ def scrape_kepco_power_planner(user_id, user_pw):
         add_log(logs, "chromedriver version: {0}".format(env_info["chromedriver_version"]))
 
         driver = build_chrome_driver(logs)
-        wait = WebDriverWait(driver, 25)
+        wait = WebDriverWait(driver, 30)
 
         login_url = "https://pp.kepco.co.kr/intro.do"
         driver.get(login_url)
@@ -998,9 +1368,9 @@ def scrape_kepco_power_planner(user_id, user_pw):
             (By.ID, "pw"),
         ]
         login_btn_selectors = [
-            (By.XPATH, "//button[contains(., '로그인')]"),
-            (By.XPATH, "//a[contains(., '로그인')]"),
-            (By.XPATH, "//input[@value='로그인']"),
+            (By.XPATH, "//button[contains(., '로그인')]") ,
+            (By.XPATH, "//a[contains(., '로그인')]") ,
+            (By.XPATH, "//input[@value='로그인']") ,
             (By.CSS_SELECTOR, "button"),
             (By.CSS_SELECTOR, "a.btn_login"),
             (By.CSS_SELECTOR, "input[type='submit']"),
@@ -1020,18 +1390,9 @@ def scrape_kepco_power_planner(user_id, user_pw):
         if not click_first(driver, login_btn_selectors, logs, "로그인 버튼"):
             return {"status": "error", "message": "로그인 버튼 selector를 찾지 못했습니다.", "logs": "\n".join(logs)}
 
-        time.sleep(3)
-        session = create_requests_session_from_driver(driver)
-
-        for page_url in [
-            "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101",
-            "https://pp.kepco.co.kr/rs/rs0106.do?menu_id=O010206",
-            "https://pp.kepco.co.kr/rp/rp0103.do?menu_id=O010303",
-        ]:
-            try:
-                session.get(page_url, timeout=15)
-            except Exception:
-                pass
+        wait.until(lambda d: "Logout" in d.page_source or "스마트뷰" in d.page_source or "고객정보" in d.page_source)
+        time.sleep(2)
+        add_log(logs, "로그인 성공 및 메인 진입 확인")
 
         result = {
             "contract_kind": "",
@@ -1045,6 +1406,7 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "primary_voltage_kv": 22.9,
             "contract_power_kw": 0.0,
             "supply_voltage_text": "",
+            "meter_read_day": 0,
             "yearly_bill_won": 0.0,
             "voltage_class": "",
             "auto_avg_base_kw": 0.0,
@@ -1056,64 +1418,140 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "auto_peak_ratio": 0.0,
         }
 
-        contract_info = fetch_json(session, "https://pp.kepco.co.kr/rm/rm0101_contract_info.do", logs, "rm0101_contract_info.do") or {}
-        smart_summary = fetch_json(session, "https://pp.kepco.co.kr/rm/getRM0101.do", logs, "getRM0101.do") or {}
-        selected_period_rows = fetch_json(session, "https://pp.kepco.co.kr/rs/rs0106_chart.do", logs, "rs0106_chart.do")
-        selected_hour_rows = fetch_json(session, "https://pp.kepco.co.kr/rs/rs0101N_hour.do", logs, "rs0101N_hour.do")
-        monthly_pf_rows = fetch_json(session, "https://pp.kepco.co.kr/rp/rp0103_usage_pf_list.do", logs, "rp0103_usage_pf_list.do")
-        if monthly_pf_rows is None:
-            monthly_pf_rows = fetch_json(session, "https://pp.kepco.co.kr/rp/p0103_usage_pf_list.do", logs, "p0103_usage_pf_list.do")
-        if monthly_pf_rows is None:
-            monthly_pf_rows = []
+        pages_to_visit = [
+            {
+                "label": "스마트뷰",
+                "url": "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101",
+                "ready": ["스마트뷰", "실시간사용량"],
+                "parser": scrape_smartview_page,
+            },
+            {
+                "label": "시간대별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0101N.do?menu_id=O010201",
+                "ready": ["시간대별", "사용량"],
+                "parser": scrape_hourly_usage_page,
+            },
+            {
+                "label": "일별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0102.do?menu_id=O010202",
+                "ready": ["일별", "사용량"],
+                "parser": scrape_daily_usage_page,
+            },
+            {
+                "label": "월별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0103.do?menu_id=O010203",
+                "ready": ["월별", "사용량"],
+                "parser": scrape_monthly_usage_page,
+            },
+            {
+                "label": "연도별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204",
+                "ready": ["연도별", "사용량"],
+                "parser": scrape_yearly_usage_page,
+            },
+            {
+                "label": "시간대별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
+                "ready": ["시간대별", "패턴기간"],
+                "parser": None,
+            },
+            {
+                "label": "요일별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0102.do?menu_id=O010302",
+                "ready": ["요일별", "패턴기간"],
+                "parser": None,
+            },
+            {
+                "label": "월별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0103.do?menu_id=O010303",
+                "ready": ["월별", "패턴기간"],
+                "parser": None,
+            },
+            {
+                "label": "실시간·예상요금",
+                "url": "https://pp.kepco.co.kr/pr/pr0101.do?menu_id=O010401",
+                "ready": ["실시간·예상요금", "실시간"],
+                "parser": scrape_realtime_charge_page,
+            },
+            {
+                "label": "시간대별요금",
+                "url": "https://pp.kepco.co.kr/re/re0102.do?menu_id=O010402",
+                "ready": ["시간대별요금", "사용요금"],
+                "parser": scrape_timeband_charge_page,
+            },
+            {
+                "label": "고객정보",
+                "url": "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601",
+                "ready": ["고객정보", "계약종별"],
+                "parser": scrape_customer_info_page,
+            },
+        ]
 
-        contract_kind = (contract_info.get("CNTR_KND_NM") or smart_summary.get("CNTR_KND_NM") or "").strip()
-        result["contract_kind"] = contract_kind
-        result["contract_power_kw"] = parse_number(contract_info.get("CNTR_PWR")) or parse_number(smart_summary.get("CNTR_PWR"))
-        result["power_bill_kw"] = parse_number(smart_summary.get("JOJ_KW")) or parse_number(smart_summary.get("CNTR_PWR"))
-        result["max_demand_kw"] = parse_number(smart_summary.get("REAL_MAX_PWR")) or parse_number(smart_summary.get("MAX_PWR"))
+        for page_meta in pages_to_visit:
+            try:
+                page = visit_powerplanner_page(
+                    driver=driver,
+                    wait=wait,
+                    by=By,
+                    url=page_meta["url"],
+                    logs=logs,
+                    label=page_meta["label"],
+                    ready_patterns=page_meta.get("ready"),
+                )
+                parser = page_meta.get("parser")
+                if parser is not None:
+                    parser(page, result, logs)
+            except Exception as page_error:
+                add_log(logs, f"{page_meta['label']} 처리 실패: {page_error}")
+                add_log(logs, traceback.format_exc())
 
-        basic_charge_unit, off_peak_rate, mid_peak_rate, peak_rate = extract_rates_from_contract_info(contract_info)
-        result["basic_charge_unit"] = basic_charge_unit or parse_number(smart_summary.get("BASE_BILL_UCOST"))
-        result["off_peak_rate"] = off_peak_rate
-        result["mid_peak_rate"] = mid_peak_rate
-        result["peak_rate"] = peak_rate
-
-        voltage_class = classify_voltage_from_contract_kind(contract_kind, contract_info.get("SUPPLY_TEXT", ""))
-        if not voltage_class:
-            lhv = str(contract_info.get("LHV_CLCD") or smart_summary.get("LHV_CLCD") or "")
-            voltage_class = {"0": "저압", "1": "고압A", "2": "고압B", "3": "고압C"}.get(lhv, "")
-        result["voltage_class"] = voltage_class or get_voltage_class(result["primary_voltage_kv"])
-        result["primary_voltage_kv"] = primary_voltage_from_class(result["voltage_class"], contract_info.get("SUPPLY_TEXT", ""))
-        result["supply_voltage_text"] = describe_voltage_class(result["voltage_class"], result["primary_voltage_kv"])
-
-        result["annual_usage_kwh"] = sum_latest_12_months(monthly_pf_rows)
-        result["yearly_bill_won"] = parse_number(smart_summary.get("PREDICT_TOTAL_CHARGE")) or parse_number(smart_summary.get("TOTAL_CHARGE"))
-
-        hourly_map = build_hourly_map_from_rows(selected_period_rows or [])
-        if not hourly_map:
-            hourly_map = build_hourly_map_from_rows(selected_hour_rows or [])
-        band_summary = summarize_band_loads_from_hourly(hourly_map, "봄·가을")
-        if band_summary:
-            result["auto_avg_base_kw"] = band_summary["base_avg_kw"]
-            result["auto_off_peak_kw"] = band_summary["off_peak_kw"]
-            result["auto_mid_peak_kw"] = band_summary["mid_peak_kw"]
-            result["auto_peak_kw"] = band_summary["peak_kw"]
-            result["auto_off_ratio"] = band_summary["off_ratio"]
-            result["auto_mid_ratio"] = band_summary["mid_ratio"]
-            result["auto_peak_ratio"] = band_summary["peak_ratio"]
-            add_log(logs, "시간대별 평균부하 자동 산출 성공")
+        if not result["voltage_class"]:
+            result["voltage_class"] = classify_voltage_from_contract_kind(result.get("contract_kind", ""), result.get("supply_voltage_text", ""))
+        if result["primary_voltage_kv"] <= 0:
+            result["primary_voltage_kv"] = primary_voltage_from_class(result["voltage_class"], result.get("supply_voltage_text", ""))
+        if not result["supply_voltage_text"]:
+            result["supply_voltage_text"] = describe_voltage_class(result["voltage_class"], result["primary_voltage_kv"])
 
         if result["annual_usage_kwh"] <= 0 and result["auto_avg_base_kw"] > 0:
             result["annual_usage_kwh"] = result["auto_avg_base_kw"] * 24 * 365
+            add_log(logs, "연간 사용량이 없어 시간대 평균부하 기준으로 보정했습니다.")
 
         if result["contract_power_kw"] <= 0 and result["power_bill_kw"] > 0:
             result["contract_power_kw"] = result["power_bill_kw"]
         if result["power_bill_kw"] <= 0 and result["max_demand_kw"] > 0:
             result["power_bill_kw"] = result["max_demand_kw"]
 
+        success_score = 0
+        for key in [
+            "contract_kind",
+            "basic_charge_unit",
+            "power_bill_kw",
+            "max_demand_kw",
+            "annual_usage_kwh",
+            "off_peak_rate",
+            "mid_peak_rate",
+            "peak_rate",
+            "contract_power_kw",
+            "auto_avg_base_kw",
+        ]:
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                success_score += 1
+            elif isinstance(value, (int, float)) and value > 0:
+                success_score += 1
+
+        if success_score < 5:
+            return {
+                "status": "error",
+                "message": "파워플래너 화면은 열렸지만 필요한 값 추출이 충분하지 않습니다. 자동화 로그를 확인해 주세요.",
+                "logs": "\n".join(logs),
+                **result,
+            }
+
+        add_log(logs, f"최종 추출 성공 점수: {success_score}/10")
         return {
             "status": "success",
-            "message": "파워플래너 값 추출을 완료했습니다.",
+            "message": "파워플래너 화면 기준 값 추출을 완료했습니다.",
             "logs": "\n".join(logs),
             **result,
         }
@@ -1132,7 +1570,6 @@ def scrape_kepco_power_planner(user_id, user_pw):
                 driver.quit()
             except Exception:
                 pass
-
 
 # =========================================================
 # PDF 생성 함수
