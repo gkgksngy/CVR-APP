@@ -991,54 +991,81 @@ def extract_hourly_usage_map_from_tables(tables):
     hourly = {}
     for df in tables:
         sig = table_signature(df)
-        if "사용량(kWh)" not in sig or "시" not in sig:
+        if "시" not in sig:
             continue
 
         work = df.copy().fillna("")
-        work.columns = [normalize_space(c) for c in work.columns]
-        hour_idx = []
-        usage_idx = []
-        for idx, col in enumerate(work.columns):
-            ncol = normalize_space(col)
-            if ncol == "시" or ncol.startswith("시"):
-                hour_idx.append(idx)
-            if "사용량" in ncol and "kWh" in ncol:
-                usage_idx.append(idx)
-
-        if not hour_idx or not usage_idx:
-            continue
+        try:
+            if isinstance(work.columns, pd.MultiIndex):
+                work.columns = [normalize_space(" ".join([str(x) for x in col if str(x) != "nan"])) for col in work.columns]
+            else:
+                work.columns = [normalize_space(c) for c in work.columns]
+        except Exception:
+            work.columns = [normalize_space(c) for c in work.columns]
 
         for _, row in work.iterrows():
             values = [normalize_space(v) for v in row.tolist()]
-            for hi in hour_idx:
-                if hi >= len(values):
-                    continue
-                hour = parse_hour_value(values[hi])
+            for idx, cell in enumerate(values):
+                hour = parse_hour_value(cell)
                 if hour is None:
                     continue
-                candidate_usage = 0.0
-                for ui in usage_idx:
-                    if ui <= hi or ui >= len(values):
-                        continue
-                    num = parse_number(values[ui])
+                for j in range(idx + 1, min(idx + 4, len(values))):
+                    num = parse_number(values[j])
                     if num > 0:
-                        candidate_usage = num
+                        hourly[hour] = max(hourly.get(hour, 0.0), num)
                         break
-                if candidate_usage > 0:
-                    hourly[hour] = candidate_usage
     return hourly
 
 
 def extract_hourly_usage_map_from_text(text):
     hourly = {}
     raw = str(text or "")
-    for m in re.finditer(r"(?:^|\n)\s*(\d{2})\s+([0-9,]+(?:\.\d+)?)", raw, re.MULTILINE):
-        hour = parse_hour_value(m.group(1))
-        usage = parse_number(m.group(2))
-        if hour is None or usage <= 0:
+    for line in raw.splitlines():
+        line = normalize_space(line)
+        if not line:
             continue
-        hourly[hour] = usage
+        pairs = re.findall(r"(?:(\d{1,2})[:시]?(?:00)?)\s+([0-9,]{2,}(?:\.\d+)?)", line)
+        for hour_txt, usage_txt in pairs:
+            hour = parse_hour_value(hour_txt)
+            usage = parse_number(usage_txt)
+            if hour is None or usage <= 0:
+                continue
+            hourly[hour] = max(hourly.get(hour, 0.0), usage)
     return hourly
+
+
+def extract_pattern_hourly_map_from_text(text):
+    weekday = {}
+    holiday = {}
+    raw = str(text or "")
+    for line in raw.splitlines():
+        line = normalize_space(line)
+        m = re.match(r"^(\d{1,2})[:시]00\s+([0-9,]{2,}(?:\.\d+)?)\s+[0-9,\.]+\s+[0-9,\.]+\s+([0-9,]{2,}(?:\.\d+)?)", line)
+        if m:
+            hour = parse_hour_value(m.group(1))
+            if hour is None:
+                continue
+            weekday[hour] = parse_number(m.group(2))
+            holiday[hour] = parse_number(m.group(3))
+            continue
+        m2 = re.match(r"^(\d{1,2})\s+([0-9,]{2,}(?:\.\d+)?)\s+[0-9,\.]+\s+[0-9,\.]+\s+([0-9,]{2,}(?:\.\d+)?)", line)
+        if m2:
+            hour = parse_hour_value(m2.group(1))
+            if hour is None:
+                continue
+            weekday[hour] = parse_number(m2.group(2))
+            holiday[hour] = parse_number(m2.group(3))
+    mixed = {}
+    for h in sorted(set(weekday) | set(holiday)):
+        wd = weekday.get(h, 0.0)
+        hd = holiday.get(h, 0.0)
+        if wd > 0 and hd > 0:
+            mixed[h] = wd * 5.0 / 7.0 + hd * 2.0 / 7.0
+        elif wd > 0:
+            mixed[h] = wd
+        elif hd > 0:
+            mixed[h] = hd
+    return mixed
 
 
 def extract_latest_12_months_usage_from_tables(tables):
@@ -1065,7 +1092,7 @@ def extract_latest_12_months_usage_from_tables(tables):
                         continue
                     month = int(m.group(1))
                     usage = parse_number(row.get(usage_col, 0))
-                    if usage > 0:
+                    if usage > 1000:
                         monthly_rows.append((month, usage))
                 if monthly_rows:
                     monthly_rows.sort(key=lambda x: x[0], reverse=True)
@@ -1080,7 +1107,7 @@ def extract_latest_12_months_usage_from_tables(tables):
                 if "사용량합계" in normalize_space(col):
                     for v in work[col].tolist():
                         num = parse_number(v)
-                        if num > 0:
+                        if num > 1000:
                             return num
     return 0.0
 
@@ -1091,7 +1118,7 @@ def extract_latest_12_months_usage_from_text(text):
     for m in re.finditer(r"(\d{1,2})월(?:\([^\)]*\))?\s+([0-9,]+(?:\.\d+)?)", raw):
         month = int(m.group(1))
         usage = parse_number(m.group(2))
-        if usage > 0:
+        if usage > 1000:
             monthly.append((month, usage))
     if monthly:
         dedup = {}
@@ -1339,7 +1366,7 @@ def scrape_monthly_usage_page(page, result, logs):
     annual_usage = extract_latest_12_months_usage_from_tables(tables)
     if annual_usage <= 0:
         annual_usage = extract_latest_12_months_usage_from_text(page["text"])
-    if annual_usage > 0:
+    if annual_usage > 1000:
         result["annual_usage_kwh"] = max(result["annual_usage_kwh"], annual_usage)
         add_log(logs, f"월별 사용량에서 최근 합계 반영: {annual_usage:,.1f} kWh")
 
@@ -1360,6 +1387,30 @@ def scrape_yearly_usage_page(page, result, logs):
     md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
+
+
+
+def scrape_pattern_hourly_page(page, result, logs):
+    hourly_map = extract_pattern_hourly_map_from_text(page.get("text", ""))
+    if not hourly_map:
+        hourly_map = extract_hourly_usage_map_from_text(page.get("text", ""))
+    if not hourly_map:
+        tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별 패턴")
+        hourly_map = extract_hourly_usage_map_from_tables(tables)
+    if hourly_map:
+        season = month_to_season(datetime.now().month)
+        band_summary = summarize_band_loads_from_hourly(hourly_map, season)
+        if not band_summary:
+            band_summary = summarize_band_loads_from_hourly(hourly_map, "봄·가을")
+        if band_summary:
+            result["auto_avg_base_kw"] = band_summary["base_avg_kw"]
+            result["auto_off_peak_kw"] = band_summary["off_peak_kw"]
+            result["auto_mid_peak_kw"] = band_summary["mid_peak_kw"]
+            result["auto_peak_kw"] = band_summary["peak_kw"]
+            result["auto_off_ratio"] = band_summary["off_ratio"]
+            result["auto_mid_ratio"] = band_summary["mid_ratio"]
+            result["auto_peak_ratio"] = band_summary["peak_ratio"]
+            add_log(logs, f"시간대별 패턴 기준 평균부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
 
 
 def scrape_realtime_charge_page(page, result, logs):
@@ -1516,10 +1567,22 @@ def scrape_kepco_power_planner(user_id, user_pw):
                 "parser": scrape_smartview_page,
             },
             {
+                "label": "고객정보",
+                "url": "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601",
+                "ready": ["고객정보", "계약종별"],
+                "parser": scrape_customer_info_page,
+            },
+            {
                 "label": "시간대별 사용량",
                 "url": "https://pp.kepco.co.kr/rs/rs0101N.do?menu_id=O010201",
                 "ready": ["시간대별", "사용량"],
                 "parser": scrape_hourly_usage_page,
+            },
+            {
+                "label": "시간대별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
+                "ready": ["시간대별", "패턴기간"],
+                "parser": scrape_pattern_hourly_page,
             },
             {
                 "label": "일별 사용량",
@@ -1540,12 +1603,6 @@ def scrape_kepco_power_planner(user_id, user_pw):
                 "parser": scrape_yearly_usage_page,
             },
             {
-                "label": "시간대별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
-                "ready": ["시간대별", "패턴기간"],
-                "parser": None,
-            },
-            {
                 "label": "요일별 패턴",
                 "url": "https://pp.kepco.co.kr/rp/rp0102.do?menu_id=O010302",
                 "ready": ["요일별", "패턴기간"],
@@ -1560,20 +1617,14 @@ def scrape_kepco_power_planner(user_id, user_pw):
             {
                 "label": "실시간·예상요금",
                 "url": "https://pp.kepco.co.kr/pr/pr0101.do?menu_id=O010401",
-                "ready": ["실시간·예상요금", "실시간"],
+                "ready": ["실시간", "예상"],
                 "parser": scrape_realtime_charge_page,
             },
             {
                 "label": "시간대별요금",
                 "url": "https://pp.kepco.co.kr/re/re0102.do?menu_id=O010402",
-                "ready": ["시간대별요금", "사용요금"],
+                "ready": ["시간대별", "요금"],
                 "parser": scrape_timeband_charge_page,
-            },
-            {
-                "label": "고객정보",
-                "url": "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601",
-                "ready": ["고객정보", "계약종별"],
-                "parser": scrape_customer_info_page,
             },
         ]
 
@@ -1630,6 +1681,8 @@ def scrape_kepco_power_planner(user_id, user_pw):
             elif isinstance(value, (int, float)) and value > 0:
                 success_score += 1
 
+        if result.get("auto_avg_base_kw", 0.0) <= 0:
+            add_log(logs, "평균부하 자동 산출 실패: 시간대별 사용량/패턴 표에서 사업장별 값을 확정하지 못했습니다.")
         if success_score < 5:
             return {
                 "status": "error",
