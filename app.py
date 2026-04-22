@@ -77,6 +77,7 @@ DEFAULT_STATE = {
     "pp_auto_off_ratio": 0.0,
     "pp_auto_mid_ratio": 0.0,
     "pp_auto_peak_ratio": 0.0,
+    "pp_hourly_profile_kw": {},
 }
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
@@ -903,23 +904,20 @@ def month_to_season(month):
     return "봄·가을"
 
 
-def summarize_band_loads_from_hourly(hourly_map, season):
+
+def aggregate_hourly_profile_kw(hourly_map):
     """
-    실무형 시간대 평균부하 산출 로직.
+    hourly_map:
+      - 15분 자료면 key가 0,0.25,0.5... 형식이고 value는 해당 구간 kWh
+      - 시간 자료면 key가 0~23 형식이고 value는 해당 시간 kWh(=평균 kW로 간주 가능)
 
-    hourly_map: {hour_float_or_int: usage_kwh_for_interval_or_hour}
-      - keys may be ints 0~23 or quarter-hour markers like 13.25, 13.5, 13.75
-      - values are interval energy (kWh). For quarter-hour data, convert to equivalent kW by /0.25.
-
-    특징:
-      1) 실제 시간대 데이터를 우선 반영
-      2) 부하가 지나치게 평탄한 경우에도 CVR 검토용 실무 가중치 적용
-      3) 최종 비율은 전체 평균이 유지되도록 정규화
+    return:
+      {0: hour_avg_kw, ..., 23: hour_avg_kw}
     """
     if not hourly_map:
-        return None
+        return {}
 
-    normalized = []
+    buckets = {}
     for raw_key, raw_val in hourly_map.items():
         try:
             t = float(raw_key)
@@ -928,97 +926,65 @@ def summarize_band_loads_from_hourly(hourly_map, season):
             continue
         if v <= 0:
             continue
+
+        hour = int(t) % 24
         frac = round(abs(t - int(t)), 2)
+
+        # 15분 자료는 kWh / 0.25h = 평균 kW
         if frac in (0.25, 0.5, 0.75):
             kw = v / 0.25
         else:
             kw = v
-        normalized.append((t, kw))
 
-    if not normalized:
+        buckets.setdefault(hour, []).append(kw)
+
+    return {h: round(sum(vals) / len(vals), 3) for h, vals in sorted(buckets.items()) if vals}
+
+
+def summarize_band_loads_from_hourly(hourly_map, season):
+    """
+    실제 시간대별 사용량을 우선 기준으로 경/중/최 평균부하와 비율을 계산한다.
+    가중치 고정값은 사용하지 않는다.
+    """
+    hourly_profile_kw = aggregate_hourly_profile_kw(hourly_map)
+    if not hourly_profile_kw:
         return None
 
-    base_avg_kw = sum(v for _, v in normalized) / len(normalized)
+    positive_values = [v for v in hourly_profile_kw.values() if v > 0]
+    if not positive_values:
+        return None
+
+    base_avg_kw = sum(positive_values) / len(positive_values)
     if base_avg_kw <= 0:
         return None
 
-    schedule = SEASON_SCHEDULE.get(season) or SEASON_SCHEDULE['봄·가을']
-    band_buckets = {'경부하': [], '중간부하': [], '최대부하': []}
+    schedule = SEASON_SCHEDULE.get(season) or SEASON_SCHEDULE["봄·가을"]
+    band_buckets = {"경부하": [], "중간부하": [], "최대부하": []}
 
-    for t, kw in normalized:
-        hour = int(float(t)) % 24
-        band = '중간부하'
-        for candidate, hours in schedule.items():
-            if hour in hours:
-                band = candidate
-                break
+    for hour, kw in hourly_profile_kw.items():
+        band = hour_to_label(hour, season if season in SEASON_SCHEDULE else "봄·가을")
         band_buckets[band].append(kw)
 
-    off_peak_actual = sum(band_buckets['경부하']) / len(band_buckets['경부하']) if band_buckets['경부하'] else base_avg_kw
-    mid_peak_actual = sum(band_buckets['중간부하']) / len(band_buckets['중간부하']) if band_buckets['중간부하'] else base_avg_kw
-    peak_actual = sum(band_buckets['최대부하']) / len(band_buckets['최대부하']) if band_buckets['최대부하'] else base_avg_kw
+    band_avg = {}
+    for label in ["경부하", "중간부하", "최대부하"]:
+        vals = band_buckets[label]
+        band_avg[label] = (sum(vals) / len(vals)) if vals else base_avg_kw
 
-    raw_off_ratio = off_peak_actual / base_avg_kw if base_avg_kw > 0 else 1.0
-    raw_mid_ratio = mid_peak_actual / base_avg_kw if base_avg_kw > 0 else 1.0
-    raw_peak_ratio = peak_actual / base_avg_kw if base_avg_kw > 0 else 1.0
-
-    # 실무형 CVR 검토용 기본 가중치
-    practical_weights = {
-        '경부하': 0.95,
-        '중간부하': 1.00,
-        '최대부하': 1.10,
-    }
-
-    raw_spread = max(raw_off_ratio, raw_mid_ratio, raw_peak_ratio) - min(raw_off_ratio, raw_mid_ratio, raw_peak_ratio)
-
-    if raw_spread < 0.05:
-        # 실제 부하가 너무 평탄하면 실무형 가중치를 우선 적용
-        blended_off = practical_weights['경부하']
-        blended_mid = practical_weights['중간부하']
-        blended_peak = practical_weights['최대부하']
-    else:
-        # 실제 데이터 60% + 실무형 가중치 40%
-        blend_actual = 0.60
-        blend_practical = 0.40
-        blended_off = raw_off_ratio * blend_actual + practical_weights['경부하'] * blend_practical
-        blended_mid = raw_mid_ratio * blend_actual + practical_weights['중간부하'] * blend_practical
-        blended_peak = raw_peak_ratio * blend_actual + practical_weights['최대부하'] * blend_practical
-
-    off_count = max(len(band_buckets['경부하']), 1)
-    mid_count = max(len(band_buckets['중간부하']), 1)
-    peak_count = max(len(band_buckets['최대부하']), 1)
-    total_count = off_count + mid_count + peak_count
-
-    norm = (
-        blended_off * off_count +
-        blended_mid * mid_count +
-        blended_peak * peak_count
-    ) / total_count if total_count > 0 else 1.0
-    if norm <= 0:
-        norm = 1.0
-
-    off_ratio = blended_off / norm
-    mid_ratio = blended_mid / norm
-    peak_ratio = blended_peak / norm
-
-    off_peak_kw = base_avg_kw * off_ratio
-    mid_peak_kw = base_avg_kw * mid_ratio
-    peak_kw = base_avg_kw * peak_ratio
+    off_ratio = band_avg["경부하"] / base_avg_kw if base_avg_kw else 1.0
+    mid_ratio = band_avg["중간부하"] / base_avg_kw if base_avg_kw else 1.0
+    peak_ratio = band_avg["최대부하"] / base_avg_kw if base_avg_kw else 1.0
 
     return {
-        'base_avg_kw': round(base_avg_kw, 3),
-        'off_peak_kw': round(off_peak_kw, 3),
-        'mid_peak_kw': round(mid_peak_kw, 3),
-        'peak_kw': round(peak_kw, 3),
-        'off_ratio': round(off_ratio, 4),
-        'mid_ratio': round(mid_ratio, 4),
-        'peak_ratio': round(peak_ratio, 4),
-        'raw_off_ratio': round(raw_off_ratio, 4),
-        'raw_mid_ratio': round(raw_mid_ratio, 4),
-        'raw_peak_ratio': round(raw_peak_ratio, 4),
-        'raw_spread': round(raw_spread, 4),
+        "base_avg_kw": round(base_avg_kw, 3),
+        "off_peak_kw": round(band_avg["경부하"], 3),
+        "mid_peak_kw": round(band_avg["중간부하"], 3),
+        "peak_kw": round(band_avg["최대부하"], 3),
+        "off_ratio": round(off_ratio, 4),
+        "mid_ratio": round(mid_ratio, 4),
+        "peak_ratio": round(peak_ratio, 4),
+        "hourly_profile_kw": hourly_profile_kw,
+        "source": "actual_hourly_usage",
     }
-
 
 def select_15min_view_if_available(driver, by, logs, label):
     try:
@@ -1475,6 +1441,7 @@ def scrape_customer_info_page(page, result, logs):
     add_log(logs, "고객정보 해석 완료")
 
 
+
 def scrape_hourly_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별 사용량")
     hourly_map = extract_hourly_usage_map_from_tables(tables)
@@ -1492,12 +1459,13 @@ def scrape_hourly_usage_page(page, result, logs):
             result["auto_off_ratio"] = band_summary["off_ratio"]
             result["auto_mid_ratio"] = band_summary["mid_ratio"]
             result["auto_peak_ratio"] = band_summary["peak_ratio"]
-            add_log(logs, f"시간대별 부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
+            result["hourly_profile_kw"] = band_summary.get("hourly_profile_kw", {})
+            result["auto_source"] = "usage_hourly"
+            add_log(logs, f"시간대별 사용량 기준 평균부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
 
     md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
-
 
 def scrape_daily_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="일별 사용량")
@@ -1536,6 +1504,7 @@ def scrape_yearly_usage_page(page, result, logs):
 
 
 
+
 def scrape_pattern_hourly_page(page, result, logs):
     hourly_map = extract_pattern_hourly_map_from_text(page.get("text", ""))
     if not hourly_map:
@@ -1543,6 +1512,12 @@ def scrape_pattern_hourly_page(page, result, logs):
     if not hourly_map:
         tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별 패턴")
         hourly_map = extract_hourly_usage_map_from_tables(tables)
+
+    # 실제 시간대별 사용량에서 이미 자동 산출을 성공했다면 패턴 페이지는 보조 정보로만 둔다.
+    if result.get("auto_source") == "usage_hourly" and result.get("auto_avg_base_kw", 0) > 0:
+        add_log(logs, "시간대별 패턴은 보조 정보로만 확인하고, 기준 평균부하는 시간대별 사용량 값을 유지합니다.")
+        return
+
     if hourly_map:
         season = month_to_season(datetime.now().month)
         band_summary = summarize_band_loads_from_hourly(hourly_map, season)
@@ -1556,8 +1531,9 @@ def scrape_pattern_hourly_page(page, result, logs):
             result["auto_off_ratio"] = band_summary["off_ratio"]
             result["auto_mid_ratio"] = band_summary["mid_ratio"]
             result["auto_peak_ratio"] = band_summary["peak_ratio"]
+            result["hourly_profile_kw"] = band_summary.get("hourly_profile_kw", {})
+            result["auto_source"] = "pattern_hourly"
             add_log(logs, f"시간대별 패턴 기준 평균부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
-
 
 def scrape_realtime_charge_page(page, result, logs):
     text = page["text"]
@@ -1703,6 +1679,8 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "auto_off_ratio": 0.0,
             "auto_mid_ratio": 0.0,
             "auto_peak_ratio": 0.0,
+            "hourly_profile_kw": {},
+            "auto_source": "",
         }
 
         pages_to_visit = [
@@ -2436,6 +2414,7 @@ with left:
                             st.session_state["pp_auto_off_ratio"] = result.get("auto_off_ratio", 0.0)
                             st.session_state["pp_auto_mid_ratio"] = result.get("auto_mid_ratio", 0.0)
                             st.session_state["pp_auto_peak_ratio"] = result.get("auto_peak_ratio", 0.0)
+                            st.session_state["pp_hourly_profile_kw"] = result.get("hourly_profile_kw", {})
                             st.success(result["message"])
                         else:
                             st.error(result["message"])
@@ -3058,13 +3037,37 @@ st.divider()
 st.subheader("그래프")
 g1, g2 = st.columns(2)
 
+
 with g1:
+    graph_df = hourly_df.copy()
+    use_pp_profile = (
+        st.session_state.get("pp_loaded", False)
+        and input_mode == "파워플래너 자동 산출"
+        and isinstance(st.session_state.get("pp_hourly_profile_kw", {}), dict)
+        and len(st.session_state.get("pp_hourly_profile_kw", {})) >= 6
+    )
+    if use_pp_profile:
+        pp_graph_rows = []
+        pp_profile = st.session_state.get("pp_hourly_profile_kw", {})
+        for h in range(24):
+            val = float(pp_profile.get(h, 0.0))
+            pp_graph_rows.append({
+                "시간번호": h,
+                "시간": f"{h:02d}:00",
+                "전력사용량(kW)": val,
+                "구분": hour_to_label(h, season),
+                "운영여부": "가동" if h in active_hours else "비가동",
+                "절감전력(kW)": 0.0,
+                "절감전력량(kWh)": 0.0,
+            })
+        graph_df = pd.DataFrame(pp_graph_rows)
+
     fig_load = px.line(
-        hourly_df,
+        graph_df,
         x="시간번호",
         y="전력사용량(kW)",
         markers=True,
-        hover_data=["시간", "구분", "운영여부", "절감전력(kW)", "절감전력량(kWh)"],
+        hover_data=["시간", "구분", "운영여부"],
         title="{0} 시간대별 전력사용량".format(season),
     )
     fig_load.update_xaxes(
