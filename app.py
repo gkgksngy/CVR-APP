@@ -903,6 +903,88 @@ def month_to_season(month):
     return "봄·가을"
 
 
+def summarize_band_loads_from_hourly(hourly_map, season):
+    """
+    hourly_map: {hour_float_or_int: usage_kwh_for_interval_or_hour}
+    - keys may be ints 0~23 or quarter-hour markers like 13.25, 13.5, 13.75
+    - values are interval energy (kWh). For quarter-hour data, convert to equivalent kW by /0.25.
+    Returns averaged band loads and ratios against the base average load.
+    """
+    if not hourly_map:
+        return None
+
+    normalized = []
+    for raw_key, raw_val in hourly_map.items():
+        try:
+            t = float(raw_key)
+            v = float(raw_val)
+        except Exception:
+            continue
+        if v <= 0:
+            continue
+        frac = abs(t - int(t))
+        # 15-minute interval energy -> convert to equivalent average kW for the interval
+        if frac in (0.25, 0.5, 0.75):
+            kw = v / 0.25
+        else:
+            kw = v
+        normalized.append((t, kw))
+
+    if not normalized:
+        return None
+
+    base_avg_kw = sum(v for _, v in normalized) / len(normalized)
+    if base_avg_kw <= 0:
+        return None
+
+    schedule = SEASON_SCHEDULE.get(season) or SEASON_SCHEDULE['봄·가을']
+    band_buckets = {'경부하': [], '중간부하': [], '최대부하': []}
+
+    for t, kw in normalized:
+        hour = int(float(t)) % 24
+        band = '중간부하'
+        for candidate, hours in schedule.items():
+            if hour in hours:
+                band = candidate
+                break
+        band_buckets[band].append(kw)
+
+    off_peak_kw = sum(band_buckets['경부하']) / len(band_buckets['경부하']) if band_buckets['경부하'] else base_avg_kw
+    mid_peak_kw = sum(band_buckets['중간부하']) / len(band_buckets['중간부하']) if band_buckets['중간부하'] else base_avg_kw
+    peak_kw = sum(band_buckets['최대부하']) / len(band_buckets['최대부하']) if band_buckets['최대부하'] else base_avg_kw
+
+    return {
+        'base_avg_kw': round(base_avg_kw, 3),
+        'off_peak_kw': round(off_peak_kw, 3),
+        'mid_peak_kw': round(mid_peak_kw, 3),
+        'peak_kw': round(peak_kw, 3),
+        'off_ratio': round(off_peak_kw / base_avg_kw, 4) if base_avg_kw > 0 else 1.0,
+        'mid_ratio': round(mid_peak_kw / base_avg_kw, 4) if base_avg_kw > 0 else 1.0,
+        'peak_ratio': round(peak_kw / base_avg_kw, 4) if base_avg_kw > 0 else 1.0,
+    }
+
+
+def select_15min_view_if_available(driver, by, logs, label):
+    try:
+        radio_selectors = [
+            (by.XPATH, "//label[contains(normalize-space(.),'15분')]"),
+            (by.XPATH, "//span[contains(normalize-space(.),'15분')]"),
+            (by.XPATH, "//input[@type='radio' and contains(@onclick,'15') or @value='15']"),
+        ]
+        clicked = click_first(driver, radio_selectors, logs, f'{label} 15분 선택')
+        if clicked:
+            time.sleep(0.6)
+            search_selectors = [
+                (by.XPATH, "//button[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
+                (by.XPATH, "//a[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
+                (by.CSS_SELECTOR, "button"),
+            ]
+            click_first(driver, search_selectors, logs, f'{label} 조회 버튼')
+            time.sleep(1.2)
+    except Exception as e:
+        add_log(logs, f'{label} 15분 기준 설정 실패(무시): {e}')
+
+
 def extract_tariff_rates_from_tables(tables, season=None):
     if not season:
         season = month_to_season(datetime.now().month)
@@ -1216,11 +1298,19 @@ def extract_max_demand_from_text(text):
     return max(values) if values else 0.0
 
 
-def visit_powerplanner_page(driver, wait, by, url, logs, label, ready_patterns=None):
+def visit_powerplanner_page(driver, wait, by, url, logs, label, ready_patterns=None, post_load=None):
     driver.get(url)
     wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
     wait.until(lambda d: len(d.find_elements(by.TAG_NAME, "body")) > 0)
     time.sleep(1.2)
+
+    if callable(post_load):
+        try:
+            post_load(driver, by, logs, label)
+            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            time.sleep(0.8)
+        except Exception as e:
+            add_log(logs, f"{label} 후처리 실패(무시): {e}")
 
     if ready_patterns:
         body_text = driver.find_element(by.TAG_NAME, "body").text
@@ -1576,12 +1666,14 @@ def scrape_kepco_power_planner(user_id, user_pw):
                 "label": "시간대별 사용량",
                 "url": "https://pp.kepco.co.kr/rs/rs0101N.do?menu_id=O010201",
                 "ready": ["시간대별", "사용량"],
+                "post_load": select_15min_view_if_available,
                 "parser": scrape_hourly_usage_page,
             },
             {
                 "label": "시간대별 패턴",
                 "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
                 "ready": ["시간대별", "패턴기간"],
+                "post_load": select_15min_view_if_available,
                 "parser": scrape_pattern_hourly_page,
             },
             {
@@ -1638,6 +1730,7 @@ def scrape_kepco_power_planner(user_id, user_pw):
                     logs=logs,
                     label=page_meta["label"],
                     ready_patterns=page_meta.get("ready"),
+                    post_load=page_meta.get("post_load"),
                 )
                 parser = page_meta.get("parser")
                 if parser is not None:
