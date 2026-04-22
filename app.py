@@ -2367,9 +2367,9 @@ with left:
         "입력 방식",
         st.radio,
         "manual",
-        options=["수동 입력", "파워플래너 값 수동 반영", "파워플래너 자동반영"],
+        options=["파워플래너 자동반영", "파워플래너 값 수동 반영", "수동 입력"],
         horizontal=True,
-        index=1,
+        index=0,
     )
 
     if pp_mode == "파워플래너 자동반영":
