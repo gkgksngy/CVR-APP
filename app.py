@@ -905,10 +905,16 @@ def month_to_season(month):
 
 def summarize_band_loads_from_hourly(hourly_map, season):
     """
+    실무형 시간대 평균부하 산출 로직.
+
     hourly_map: {hour_float_or_int: usage_kwh_for_interval_or_hour}
-    - keys may be ints 0~23 or quarter-hour markers like 13.25, 13.5, 13.75
-    - values are interval energy (kWh). For quarter-hour data, convert to equivalent kW by /0.25.
-    Returns averaged band loads and ratios against the base average load.
+      - keys may be ints 0~23 or quarter-hour markers like 13.25, 13.5, 13.75
+      - values are interval energy (kWh). For quarter-hour data, convert to equivalent kW by /0.25.
+
+    특징:
+      1) 실제 시간대 데이터를 우선 반영
+      2) 부하가 지나치게 평탄한 경우에도 CVR 검토용 실무 가중치 적용
+      3) 최종 비율은 전체 평균이 유지되도록 정규화
     """
     if not hourly_map:
         return None
@@ -922,8 +928,7 @@ def summarize_band_loads_from_hourly(hourly_map, season):
             continue
         if v <= 0:
             continue
-        frac = abs(t - int(t))
-        # 15-minute interval energy -> convert to equivalent average kW for the interval
+        frac = round(abs(t - int(t)), 2)
         if frac in (0.25, 0.5, 0.75):
             kw = v / 0.25
         else:
@@ -949,18 +954,69 @@ def summarize_band_loads_from_hourly(hourly_map, season):
                 break
         band_buckets[band].append(kw)
 
-    off_peak_kw = sum(band_buckets['경부하']) / len(band_buckets['경부하']) if band_buckets['경부하'] else base_avg_kw
-    mid_peak_kw = sum(band_buckets['중간부하']) / len(band_buckets['중간부하']) if band_buckets['중간부하'] else base_avg_kw
-    peak_kw = sum(band_buckets['최대부하']) / len(band_buckets['최대부하']) if band_buckets['최대부하'] else base_avg_kw
+    off_peak_actual = sum(band_buckets['경부하']) / len(band_buckets['경부하']) if band_buckets['경부하'] else base_avg_kw
+    mid_peak_actual = sum(band_buckets['중간부하']) / len(band_buckets['중간부하']) if band_buckets['중간부하'] else base_avg_kw
+    peak_actual = sum(band_buckets['최대부하']) / len(band_buckets['최대부하']) if band_buckets['최대부하'] else base_avg_kw
+
+    raw_off_ratio = off_peak_actual / base_avg_kw if base_avg_kw > 0 else 1.0
+    raw_mid_ratio = mid_peak_actual / base_avg_kw if base_avg_kw > 0 else 1.0
+    raw_peak_ratio = peak_actual / base_avg_kw if base_avg_kw > 0 else 1.0
+
+    # 실무형 CVR 검토용 기본 가중치
+    practical_weights = {
+        '경부하': 0.95,
+        '중간부하': 1.00,
+        '최대부하': 1.10,
+    }
+
+    raw_spread = max(raw_off_ratio, raw_mid_ratio, raw_peak_ratio) - min(raw_off_ratio, raw_mid_ratio, raw_peak_ratio)
+
+    if raw_spread < 0.05:
+        # 실제 부하가 너무 평탄하면 실무형 가중치를 우선 적용
+        blended_off = practical_weights['경부하']
+        blended_mid = practical_weights['중간부하']
+        blended_peak = practical_weights['최대부하']
+    else:
+        # 실제 데이터 60% + 실무형 가중치 40%
+        blend_actual = 0.60
+        blend_practical = 0.40
+        blended_off = raw_off_ratio * blend_actual + practical_weights['경부하'] * blend_practical
+        blended_mid = raw_mid_ratio * blend_actual + practical_weights['중간부하'] * blend_practical
+        blended_peak = raw_peak_ratio * blend_actual + practical_weights['최대부하'] * blend_practical
+
+    off_count = max(len(band_buckets['경부하']), 1)
+    mid_count = max(len(band_buckets['중간부하']), 1)
+    peak_count = max(len(band_buckets['최대부하']), 1)
+    total_count = off_count + mid_count + peak_count
+
+    norm = (
+        blended_off * off_count +
+        blended_mid * mid_count +
+        blended_peak * peak_count
+    ) / total_count if total_count > 0 else 1.0
+    if norm <= 0:
+        norm = 1.0
+
+    off_ratio = blended_off / norm
+    mid_ratio = blended_mid / norm
+    peak_ratio = blended_peak / norm
+
+    off_peak_kw = base_avg_kw * off_ratio
+    mid_peak_kw = base_avg_kw * mid_ratio
+    peak_kw = base_avg_kw * peak_ratio
 
     return {
         'base_avg_kw': round(base_avg_kw, 3),
         'off_peak_kw': round(off_peak_kw, 3),
         'mid_peak_kw': round(mid_peak_kw, 3),
         'peak_kw': round(peak_kw, 3),
-        'off_ratio': round(off_peak_kw / base_avg_kw, 4) if base_avg_kw > 0 else 1.0,
-        'mid_ratio': round(mid_peak_kw / base_avg_kw, 4) if base_avg_kw > 0 else 1.0,
-        'peak_ratio': round(peak_kw / base_avg_kw, 4) if base_avg_kw > 0 else 1.0,
+        'off_ratio': round(off_ratio, 4),
+        'mid_ratio': round(mid_ratio, 4),
+        'peak_ratio': round(peak_ratio, 4),
+        'raw_off_ratio': round(raw_off_ratio, 4),
+        'raw_mid_ratio': round(raw_mid_ratio, 4),
+        'raw_peak_ratio': round(raw_peak_ratio, 4),
+        'raw_spread': round(raw_spread, 4),
     }
 
 
