@@ -707,32 +707,9 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
         ax.set_xticks(list(range(24)))
         ax.set_xticklabels([f"{i:02d}" for i in range(24)], fontsize=8)
         ax.grid(True, alpha=0.3)
-
-        font_prop = None
-        if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            try:
-                font_prop = fm.FontProperties(fname=font_info["font_path"])
-            except Exception:
-                font_prop = None
-
-        if font_prop is None and font_info.get("mpl_name"):
-            try:
-                font_prop = fm.FontProperties(family=font_info["mpl_name"])
-            except Exception:
-                font_prop = None
-
-        # 제목은 PDF 본문 문단(5-1)에서 이미 표시하므로 차트 내부 제목은 제거
         ax.set_title("")
-        if font_prop is not None:
-            ax.set_xlabel("시간", fontproperties=font_prop)
-            ax.set_ylabel("전력사용량(kW)", fontproperties=font_prop)
-            for label in ax.get_xticklabels():
-                label.set_fontproperties(font_prop)
-            for label in ax.get_yticklabels():
-                label.set_fontproperties(font_prop)
-        else:
-            ax.set_xlabel("시간")
-            ax.set_ylabel("전력사용량(kW)")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -755,54 +732,20 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         bars = ax.bar(x_labels, y_vals)
         ax.grid(True, axis="y", alpha=0.3)
         ax.invert_xaxis()
-
-        font_prop = None
-        if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            try:
-                font_prop = fm.FontProperties(fname=font_info["font_path"])
-            except Exception:
-                font_prop = None
-
-        if font_prop is None and font_info.get("mpl_name"):
-            try:
-                font_prop = fm.FontProperties(family=font_info["mpl_name"])
-            except Exception:
-                font_prop = None
-
-        # 제목은 PDF 본문 문단(5-2)에서 이미 표시하므로 차트 내부 제목은 제거
         ax.set_title("")
-        if font_prop is not None:
-            ax.set_xlabel("탭", fontproperties=font_prop)
-            ax.set_ylabel("평균 절감전력(kW)", fontproperties=font_prop)
-            for label in ax.get_xticklabels():
-                label.set_fontproperties(font_prop)
-            for label in ax.get_yticklabels():
-                label.set_fontproperties(font_prop)
-        else:
-            ax.set_xlabel("탭")
-            ax.set_ylabel("평균 절감전력(kW)")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
 
         for rect, val in zip(bars, y_vals):
             label = "0" if float(val) == 0 else f"{float(val):.3f}"
-            if font_prop is not None:
-                ax.text(
-                    rect.get_x() + rect.get_width() / 2,
-                    rect.get_height(),
-                    label,
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    fontproperties=font_prop,
-                )
-            else:
-                ax.text(
-                    rect.get_x() + rect.get_width() / 2,
-                    rect.get_height(),
-                    label,
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height(),
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -2128,12 +2071,16 @@ def build_pdf_bytes_report(
 
     elements.append(Paragraph("5. 그래프", styles["KHeading"]))
     elements.append(Paragraph("5-1. 시간대별 전력사용량 그래프", styles["KBody"]))
+    elements.append(Spacer(1, 2))
+    elements.append(Paragraph("X축: 시간 / Y축: 전력사용량(kW)", styles["KBody"]))
     elements.append(Spacer(1, 4))
     elements.append(RLImage(fig_line_buf, width=180*mm, height=86*mm))
     elements.append(PageBreak())
 
     # 3페이지
     elements.append(Paragraph("5-2. 탭별 예상 절감전력 비교", styles["KBody"]))
+    elements.append(Spacer(1, 2))
+    elements.append(Paragraph("X축: 탭 / Y축: 평균 절감전력(kW)", styles["KBody"]))
     elements.append(Spacer(1, 4))
     elements.append(RLImage(fig_bar_buf, width=180*mm, height=86*mm))
     elements.append(Spacer(1, 10))
