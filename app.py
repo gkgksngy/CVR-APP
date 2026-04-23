@@ -1,3 +1,4 @@
+
 import io
 import os
 import re
@@ -6,16 +7,11 @@ import time
 import math
 import subprocess
 import importlib.util
-import tempfile
-import shutil
-import traceback
 from datetime import datetime
 
 import pandas as pd
-import requests
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -34,10 +30,8 @@ from reportlab.platypus import (
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 
 
 st.set_page_config(page_title="CVR 운영형 계산기", layout="wide")
@@ -47,7 +41,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
 # =========================================================
 # 세션 초기화
@@ -67,17 +60,7 @@ DEFAULT_STATE = {
     "pp_primary_voltage_kv": 154.0,
     "pp_contract_power_kw": 0.0,
     "pp_supply_voltage_text": "",
-    "pp_meter_read_day": 0,
     "pp_yearly_bill_won": 0.0,
-    "pp_voltage_class": "",
-    "pp_auto_avg_base_kw": 0.0,
-    "pp_auto_off_peak_kw": 0.0,
-    "pp_auto_mid_peak_kw": 0.0,
-    "pp_auto_peak_kw": 0.0,
-    "pp_auto_off_ratio": 0.0,
-    "pp_auto_mid_ratio": 0.0,
-    "pp_auto_peak_ratio": 0.0,
-    "pp_hourly_profile_kw": {},
 }
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
@@ -178,126 +161,6 @@ def has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
 
-def run_command_capture(cmd):
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
-    except Exception as e:
-        return -1, "", str(e)
-
-
-def first_existing_path(candidates):
-    for path in candidates:
-        if path and os.path.exists(path):
-            return path
-    return None
-
-
-def get_chrome_binary_candidates():
-    return [
-        os.environ.get("CHROME_BINARY"),
-        os.environ.get("GOOGLE_CHROME_BIN"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ]
-
-
-def get_chromedriver_candidates():
-    return [
-        os.environ.get("CHROMEDRIVER_PATH"),
-        shutil.which("chromedriver"),
-        "/usr/bin/chromedriver",
-        "/usr/local/bin/chromedriver",
-    ]
-
-
-def get_runtime_environment_summary():
-    chrome_path = first_existing_path(get_chrome_binary_candidates())
-    chromedriver_path = first_existing_path(get_chromedriver_candidates())
-
-    chrome_ver = "-"
-    chromedriver_ver = "-"
-
-    if chrome_path:
-        rc, out, err = run_command_capture([chrome_path, "--version"])
-        chrome_ver = out if rc == 0 and out else (err or "확인 실패")
-
-    if chromedriver_path:
-        rc, out, err = run_command_capture([chromedriver_path, "--version"])
-        chromedriver_ver = out if rc == 0 and out else (err or "확인 실패")
-
-    return {
-        "python": sys.executable,
-        "platform": sys.platform,
-        "chrome_path": chrome_path or "-",
-        "chrome_version": chrome_ver,
-        "chromedriver_path": chromedriver_path or "-",
-        "chromedriver_version": chromedriver_ver,
-    }
-
-
-def build_chrome_driver(logs):
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
-
-    chrome_binary = first_existing_path(get_chrome_binary_candidates())
-    chromedriver_path = first_existing_path(get_chromedriver_candidates())
-
-    if not chrome_binary:
-        raise RuntimeError(
-            "크롬/크로미움 실행 파일을 찾지 못했습니다. "
-            "배포 서버에 chromium 또는 google-chrome 설치가 필요합니다."
-        )
-
-    options = Options()
-    options.binary_location = chrome_binary
-
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--remote-debugging-port=9222")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--lang=ko-KR")
-    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-
-    tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
-    tmp_data = tempfile.mkdtemp(prefix="chrome-data-")
-    options.add_argument(f"--user-data-dir={tmp_profile}")
-    options.add_argument(f"--data-path={tmp_data}")
-
-    add_log(logs, f"chrome binary: {chrome_binary}")
-    add_log(logs, f"chromedriver path: {chromedriver_path or 'selenium manager 사용'}")
-
-    try:
-        if chromedriver_path:
-            service = Service(executable_path=chromedriver_path)
-            driver = webdriver.Chrome(service=service, options=options)
-        else:
-            driver = webdriver.Chrome(options=options)
-
-        driver.set_page_load_timeout(40)
-        driver.implicitly_wait(2)
-        return driver
-    except Exception:
-        shutil.rmtree(tmp_profile, ignore_errors=True)
-        shutil.rmtree(tmp_data, ignore_errors=True)
-        raise
-
-
 def install_package_for_current_python(packages):
     cmd = [sys.executable, "-m", "pip", "install"] + packages
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -319,42 +182,10 @@ def parse_number(text):
 def parse_voltage_from_text(text):
     if not text:
         return 0.0
-    raw = str(text)
-    low_voltage_match = re.search(r"(220/380|380/220|380V|220V)", raw, re.IGNORECASE)
-    if low_voltage_match:
-        return 0.38
-    m = re.search(r"(\d+(?:\.\d+)?)\s*kV", raw, re.IGNORECASE)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*kV", str(text), re.IGNORECASE)
     if m:
         return float(m.group(1))
     return 0.0
-
-
-def classify_voltage_from_contract_kind(contract_kind, supply_text=""):
-    raw = f"{contract_kind or ''} {supply_text or ''}".replace(" ", "")
-    if "저압" in raw or "220/380" in raw or "380V" in raw or "220V" in raw:
-        return "저압"
-    if "고압C" in raw or "345" in raw:
-        return "고압C"
-    if "고압B" in raw or "154" in raw:
-        return "고압B"
-    if "고압A" in raw or "22.9" in raw:
-        return "고압A"
-    return ""
-
-
-def primary_voltage_from_class(voltage_class, supply_text=""):
-    parsed = parse_voltage_from_text(supply_text)
-    if parsed > 0:
-        return parsed
-    if voltage_class == "저압":
-        return 0.38
-    if voltage_class == "고압A":
-        return 22.9
-    if voltage_class == "고압B":
-        return 154.0
-    if voltage_class == "고압C":
-        return 345.0
-    return 22.9
 
 
 def get_voltage_class(primary_kv):
@@ -362,16 +193,14 @@ def get_voltage_class(primary_kv):
         return "저압"
     if 3.3 <= primary_kv <= 66.0:
         return "고압A"
-    if 100.0 <= primary_kv < 300.0:
+    if abs(primary_kv - 154.0) < 5.0:
         return "고압B"
-    if primary_kv >= 300.0:
+    if primary_kv >= 345.0:
         return "고압C"
     return "고압A"
 
 
 def describe_voltage_class(voltage_class, primary_kv):
-    if voltage_class == "저압":
-        return "저압"
     if voltage_class == "고압A":
         return f"고압A ({primary_kv:.1f}kV)"
     if voltage_class == "고압B":
@@ -494,149 +323,36 @@ def choose_latest_full_year(rows):
     return sorted(rows, key=lambda x: int(x["year"]), reverse=True)[0]
 
 
-CURRENT_PDF_FONT_NAME = "Helvetica"
-
-
-def get_korean_font_info():
-    candidates = [
-        {
-            "pdf_name": "Malgun",
-            "mpl_fallback_name": "Malgun Gothic",
-            "path": "C:/Windows/Fonts/malgun.ttf",
-        },
-        {
-            "pdf_name": "NanumGothic",
-            "mpl_fallback_name": "NanumGothic",
-            "path": "C:/Windows/Fonts/NanumGothic.ttf",
-        },
-        {
-            "pdf_name": "NanumBarunGothic",
-            "mpl_fallback_name": "NanumBarunGothic",
-            "path": "C:/Windows/Fonts/NanumBarunGothic.ttf",
-        },
-        {
-            "pdf_name": "AppleGothic",
-            "mpl_fallback_name": "AppleGothic",
-            "path": "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-        },
-        {
-            "pdf_name": "NanumGothicLinux",
-            "mpl_fallback_name": "NanumGothic",
-            "path": "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-        },
-        {
-            "pdf_name": "NotoSansKR",
-            "mpl_fallback_name": "Noto Sans CJK KR",
-            "path": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        },
-        {
-            "pdf_name": "NotoSansKR",
-            "mpl_fallback_name": "Noto Sans CJK KR",
-            "path": "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
-        },
+def get_pdf_font_name():
+    font_candidates = [
+        ("Malgun", "C:/Windows/Fonts/malgun.ttf"),
+        ("NanumGothic", "C:/Windows/Fonts/NanumGothic.ttf"),
+        ("NanumGothicBold", "C:/Windows/Fonts/NanumGothicBold.ttf"),
     ]
-
-    for item in candidates:
-        font_path = item["path"]
+    for font_name, font_path in font_candidates:
         if os.path.exists(font_path):
-            pdf_name = item["pdf_name"]
-            registered_ok = False
             try:
-                registered = pdfmetrics.getRegisteredFontNames()
-                if pdf_name not in registered:
-                    pdfmetrics.registerFont(TTFont(pdf_name, font_path))
-                registered_ok = True
+                pdfmetrics.registerFont(TTFont(font_name, font_path))
+                return font_name
             except Exception:
-                registered_ok = False
-
-            try:
-                mpl_name = fm.FontProperties(fname=font_path).get_name()
-            except Exception:
-                mpl_name = item["mpl_fallback_name"]
-
-            if registered_ok:
-                return {
-                    "pdf_name": pdf_name,
-                    "font_path": font_path,
-                    "mpl_name": mpl_name,
-                }
-
-            return {
-                "pdf_name": "HYGothic-Medium",
-                "font_path": font_path,
-                "mpl_name": mpl_name,
-            }
-
-    preferred_font_files = []
-    try:
-        for font_path in fm.findSystemFonts(fontpaths=None, fontext="ttf") + fm.findSystemFonts(fontpaths=None, fontext="ttc") + fm.findSystemFonts(fontpaths=None, fontext="otf"):
-            name = os.path.basename(font_path).lower()
-            if any(key in name for key in ["notosanscjk", "notosanskr", "nanumgothic", "nanumbarungothic", "malgun", "applegothic"]):
-                preferred_font_files.append(font_path)
-    except Exception:
-        preferred_font_files = []
-
-    for font_path in preferred_font_files:
-        try:
-            pdf_name = os.path.splitext(os.path.basename(font_path))[0][:30] or "KoreanFont"
-            registered = pdfmetrics.getRegisteredFontNames()
-            if pdf_name not in registered:
-                pdfmetrics.registerFont(TTFont(pdf_name, font_path))
-            mpl_name = fm.FontProperties(fname=font_path).get_name()
-            return {
-                "pdf_name": pdf_name,
-                "font_path": font_path,
-                "mpl_name": mpl_name,
-            }
-        except Exception:
-            continue
-
-    try:
-        registered = pdfmetrics.getRegisteredFontNames()
-        if "HYGothic-Medium" not in registered:
-            pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
-        return {
-            "pdf_name": "HYGothic-Medium",
-            "font_path": None,
-            "mpl_name": "DejaVu Sans",
-        }
-    except Exception:
-        return {
-            "pdf_name": "Helvetica",
-            "font_path": None,
-            "mpl_name": "DejaVu Sans",
-        }
+                continue
+    return "Helvetica"
 
 
-def _wrap_table_data(data, font_name="Helvetica", font_size=9):
-    styles = getSampleStyleSheet()
-    cell_style = ParagraphStyle(
-        "TableCellWrap",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=font_size,
-        leading=max(font_size + 1.5, font_size * 1.15),
-        alignment=1,
-        wordWrap="CJK",
-    )
-    wrapped = []
-    for row in data:
-        wrapped_row = []
-        for cell in row:
-            if isinstance(cell, Paragraph):
-                wrapped_row.append(cell)
-            elif isinstance(cell, str):
-                safe = cell.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
-                wrapped_row.append(Paragraph(safe, cell_style))
-            else:
-                wrapped_row.append(cell)
-        wrapped.append(wrapped_row)
-    return wrapped
+def get_matplotlib_font_family():
+    candidates = [
+        ("Malgun Gothic", "C:/Windows/Fonts/malgun.ttf"),
+        ("NanumGothic", "C:/Windows/Fonts/NanumGothic.ttf"),
+        ("AppleGothic", "/System/Library/Fonts/Supplemental/AppleGothic.ttf"),
+    ]
+    for family_name, font_path in candidates:
+        if os.path.exists(font_path):
+            return family_name
+    return "DejaVu Sans"
 
 
 def make_two_col_table(data, col_widths=None, font_name="Helvetica", font_size=9):
-    wrapped = _wrap_table_data(data, font_name=font_name, font_size=font_size)
-    tbl = Table(wrapped, colWidths=col_widths, repeatRows=1)
+    tbl = Table(data, colWidths=col_widths, repeatRows=1)
     tbl.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), font_name),
         ("FONTSIZE", (0, 0), (-1, -1), font_size),
@@ -651,8 +367,7 @@ def make_two_col_table(data, col_widths=None, font_name="Helvetica", font_size=9
 
 
 def make_long_table(data, col_widths=None, font_name="Helvetica", font_size=8):
-    wrapped = _wrap_table_data(data, font_name=font_name, font_size=font_size)
-    tbl = LongTable(wrapped, colWidths=col_widths, repeatRows=1)
+    tbl = LongTable(data, colWidths=col_widths, repeatRows=1)
     tbl.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), font_name),
         ("FONTSIZE", (0, 0), (-1, -1), font_size),
@@ -684,97 +399,56 @@ def format_hour_range(hours):
     return ", ".join([f"{s:02d}:00 ~ {e:02d}:00" for s, e in ranges])
 
 
-def _apply_font_to_axis(ax, font_prop):
-    ax.title.set_fontproperties(font_prop)
-    ax.xaxis.label.set_fontproperties(font_prop)
-    ax.yaxis.label.set_fontproperties(font_prop)
+def create_matplotlib_line_chart(hourly_df, season, font_family="DejaVu Sans"):
+    plt.rcParams["font.family"] = font_family
+    plt.rcParams["axes.unicode_minus"] = False
 
-    for label in ax.get_xticklabels():
-        label.set_fontproperties(font_prop)
-    for label in ax.get_yticklabels():
-        label.set_fontproperties(font_prop)
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.plot(hourly_df["시간번호"], hourly_df["전력사용량(kW)"], marker="o", linewidth=1.8)
+    ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12)
+    ax.set_xlabel("시간")
+    ax.set_ylabel("전력사용량(kW)")
+    ax.set_xticks(list(range(24)))
+    ax.set_xticklabels([f"{i:02d}" for i in range(24)], fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-    leg = ax.get_legend()
-    if leg:
-        for text in leg.get_texts():
-            text.set_fontproperties(font_prop)
-
-
-def create_matplotlib_line_chart(hourly_df, season, font_info):
-    with plt.rc_context({"axes.unicode_minus": False}):
-        if font_info.get("mpl_name"):
-            plt.rcParams["font.family"] = font_info["mpl_name"]
-        fig, ax = plt.subplots(figsize=(10, 4.8))
-        ax.plot(hourly_df["시간번호"], hourly_df["전력사용량(kW)"], marker="o", linewidth=1.8)
-        ax.set_xticks(list(range(24)))
-        ax.set_xticklabels([f"{i:02d}" for i in range(24)], fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-        font_prop = None
-        if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            font_prop = fm.FontProperties(fname=font_info["font_path"])
-        elif font_info.get("mpl_name"):
-            font_prop = fm.FontProperties(family=font_info["mpl_name"])
-
-        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
-        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
-        ax.set_title("")
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-        if font_prop is not None:
-            _apply_font_to_axis(ax, font_prop)
-
-        buf = io.BytesIO()
-        fig.tight_layout()
-        fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-        return buf
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 
-def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
-    with plt.rc_context({"axes.unicode_minus": False}):
-        if font_info.get("mpl_name"):
-            plt.rcParams["font.family"] = font_info["mpl_name"]
-        plot_df = tap_compare_df.copy()
-        plot_df["탭"] = pd.to_numeric(plot_df["탭"], errors="coerce")
-        plot_df = plot_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
-        fig, ax = plt.subplots(figsize=(10, 4.8))
-        x_labels = plot_df["탭"].astype(int).astype(str)
-        y_vals = plot_df["평균 절감전력(kW)"]
-        bars = ax.bar(x_labels, y_vals)
-        ax.grid(True, axis="y", alpha=0.3)
-        ax.invert_xaxis()
+def create_matplotlib_bar_chart(tap_compare_df, site_name, font_family="DejaVu Sans"):
+    plt.rcParams["font.family"] = font_family
+    plt.rcParams["axes.unicode_minus"] = False
 
-        font_prop = None
-        if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            font_prop = fm.FontProperties(fname=font_info["font_path"])
-        elif font_info.get("mpl_name"):
-            font_prop = fm.FontProperties(family=font_info["mpl_name"])
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    x_labels = tap_compare_df["탭"].astype(str).tolist()
+    y_values = tap_compare_df["평균 절감전력(kW)"].tolist()
 
-        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
-        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
-        ax.set_title("")
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-        if font_prop is not None:
-            _apply_font_to_axis(ax, font_prop)
+    ax.bar(x_labels, y_values)
+    ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12)
+    ax.set_xlabel("탭")
+    ax.set_ylabel("평균 절감전력(kW)")
+    ax.grid(True, axis="y", alpha=0.3)
 
-        for rect, val in zip(bars, y_vals):
-            label = "0" if float(val) == 0 else f"{float(val):.3f}"
-            ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(), label, ha="center", va="bottom", fontsize=8)
+    for idx, value in enumerate(y_values):
+        ax.text(idx, value, f"{value:.3f}".rstrip("0").rstrip("."), ha="center", va="bottom", fontsize=8)
 
-        buf = io.BytesIO()
-        fig.tight_layout()
-        fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-        return buf
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 
 def split_even_rows(data):
     if len(data) <= 1:
-        return data, [["시간", "시간번호", "구분", "운영여부", "전력사용량(kW)", "절감률(%)", "절감전력(kW)", "절감전력량(kWh)", "요금단가(원/kWh)", "절감요금(원)"]]
+        header = ["시간", "시간번호", "구분", "운영여부", "전력사용량(kW)", "절감률(%)", "절감전력(kW)", "절감전력량(kWh)", "요금단가(원/kWh)", "절감요금(원)"]
+        return data, [header]
     header = data[0]
     body = data[1:]
     mid = math.ceil(len(body) / 2)
@@ -783,802 +457,43 @@ def split_even_rows(data):
 
 def add_page_number(canvas, doc):
     canvas.saveState()
-    try:
-        canvas.setFont(CURRENT_PDF_FONT_NAME, 8)
-    except Exception:
-        canvas.setFont("Helvetica", 8)
+    canvas.setFont("Helvetica", 8)
     page_num = canvas.getPageNumber()
     canvas.drawRightString(doc.pagesize[0] - 15 * mm, 10 * mm, f"{page_num}")
     canvas.restoreState()
 
 
-
 # =========================================================
-# 파워플래너 화면 해석 보조 함수
+# Selenium 보조 함수
 # =========================================================
-def normalize_space(text):
-    return re.sub(r"\s+", " ", str(text or "")).strip()
-
-
-def normalize_key(text):
-    return re.sub(r"\s+", "", str(text or "")).strip()
-
-
-def safe_read_html_tables(html, logs=None, label=""):
-    try:
-        return pd.read_html(io.StringIO(html))
-    except Exception as e:
-        if logs is not None and label:
-            add_log(logs, f"{label} 표 해석 실패: {e}")
-        return []
-
-
-def table_signature(df):
-    try:
-        parts = [" ".join([normalize_space(str(c)) for c in df.columns.tolist()])]
-        preview_rows = min(len(df), 8)
-        for i in range(preview_rows):
-            row = df.iloc[i].tolist()
-            parts.append(" ".join([normalize_space(str(v)) for v in row]))
-        return normalize_space(" ".join(parts))
-    except Exception:
-        return ""
-
-
-def find_table_by_keywords(tables, keywords):
-    normalized_keywords = [normalize_space(k) for k in keywords if k]
-    for df in tables:
-        signature = table_signature(df)
-        if all(k in signature for k in normalized_keywords):
-            return df.copy()
+def find_first(driver, selectors):
+    for by, selector in selectors:
+        try:
+            elems = driver.find_elements(by, selector)
+            if elems:
+                return elems[0]
+        except Exception:
+            continue
     return None
 
 
-def flatten_table_pairs(df):
-    pairs = {}
-    if df is None or df.empty:
-        return pairs
-
-    try:
-        working = df.copy().fillna("")
-        working.columns = [normalize_space(c) for c in working.columns]
-        values = working.astype(str).values.tolist()
-        for row in values:
-            row = [normalize_space(v) for v in row]
-            if not any(row):
-                continue
-            for i in range(0, len(row) - 1, 2):
-                key = row[i]
-                val = row[i + 1]
-                if not key or not val:
-                    continue
-                if normalize_key(key) == normalize_key(val):
-                    continue
-                pairs[key] = val
-    except Exception:
-        return pairs
-
-    return pairs
-
-
-def extract_pairs_from_tables(tables):
-    pairs = {}
-    for df in tables:
-        pairs.update(flatten_table_pairs(df))
-    return pairs
-
-
-def pick_pair_value(pairs, patterns):
-    if not pairs:
-        return ""
-    items = list(pairs.items())
-    for pattern in patterns:
-        if isinstance(pattern, (list, tuple)):
-            need = [normalize_key(x) for x in pattern]
-            for key, value in items:
-                nkey = normalize_key(key)
-                if all(x in nkey for x in need):
-                    return str(value)
-        else:
-            need = normalize_key(pattern)
-            for key, value in items:
-                if need and need in normalize_key(key):
-                    return str(value)
-    return ""
-
-
-def extract_first_regex(text, patterns):
-    raw = str(text or "")
-    for pattern in patterns:
-        m = re.search(pattern, raw, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-        if m:
-            return normalize_space(m.group(1))
-    return ""
-
-
-def month_to_season(month):
-    if month in [6, 7, 8]:
-        return "여름"
-    if month in [11, 12, 1, 2]:
-        return "겨울"
-    return "봄·가을"
-
-
-
-def aggregate_hourly_profile_kw(hourly_map):
-    """
-    hourly_map:
-      - 15분 자료면 key가 0,0.25,0.5... 형식이고 value는 해당 구간 kWh
-      - 시간 자료면 key가 0~23 형식이고 value는 해당 시간 kWh(=평균 kW로 간주 가능)
-
-    return:
-      {0: hour_avg_kw, ..., 23: hour_avg_kw}
-    """
-    if not hourly_map:
-        return {}
-
-    buckets = {}
-    for raw_key, raw_val in hourly_map.items():
+def click_first(driver, selectors, logs, label):
+    for by, selector in selectors:
         try:
-            t = float(raw_key)
-            v = float(raw_val)
+            elems = driver.find_elements(by, selector)
+            if elems:
+                driver.execute_script("arguments[0].click();", elems[0])
+                add_log(logs, "{0} 클릭 성공: {1}".format(label, selector))
+                return True
         except Exception:
             continue
-        if v <= 0:
-            continue
+    add_log(logs, "{0} 클릭 실패".format(label))
+    return False
 
-        hour = int(t) % 24
-        frac = round(abs(t - int(t)), 2)
 
-        # 15분 자료는 kWh / 0.25h = 평균 kW
-        if frac in (0.25, 0.5, 0.75):
-            kw = v / 0.25
-        else:
-            kw = v
-
-        buckets.setdefault(hour, []).append(kw)
-
-    return {h: round(sum(vals) / len(vals), 3) for h, vals in sorted(buckets.items()) if vals}
-
-
-def summarize_band_loads_from_hourly(hourly_map, season):
-    """
-    실제 시간대별 사용량을 우선 기준으로 경/중/최 평균부하와 비율을 계산한다.
-    가중치 고정값은 사용하지 않는다.
-    """
-    hourly_profile_kw = aggregate_hourly_profile_kw(hourly_map)
-    if not hourly_profile_kw:
-        return None
-
-    positive_values = [v for v in hourly_profile_kw.values() if v > 0]
-    if not positive_values:
-        return None
-
-    base_avg_kw = sum(positive_values) / len(positive_values)
-    if base_avg_kw <= 0:
-        return None
-
-    schedule = SEASON_SCHEDULE.get(season) or SEASON_SCHEDULE["봄·가을"]
-    band_buckets = {"경부하": [], "중간부하": [], "최대부하": []}
-
-    for hour, kw in hourly_profile_kw.items():
-        band = hour_to_label(hour, season if season in SEASON_SCHEDULE else "봄·가을")
-        band_buckets[band].append(kw)
-
-    band_avg = {}
-    for label in ["경부하", "중간부하", "최대부하"]:
-        vals = band_buckets[label]
-        band_avg[label] = (sum(vals) / len(vals)) if vals else base_avg_kw
-
-    off_ratio = band_avg["경부하"] / base_avg_kw if base_avg_kw else 1.0
-    mid_ratio = band_avg["중간부하"] / base_avg_kw if base_avg_kw else 1.0
-    peak_ratio = band_avg["최대부하"] / base_avg_kw if base_avg_kw else 1.0
-
-    return {
-        "base_avg_kw": round(base_avg_kw, 3),
-        "off_peak_kw": round(band_avg["경부하"], 3),
-        "mid_peak_kw": round(band_avg["중간부하"], 3),
-        "peak_kw": round(band_avg["최대부하"], 3),
-        "off_ratio": round(off_ratio, 4),
-        "mid_ratio": round(mid_ratio, 4),
-        "peak_ratio": round(peak_ratio, 4),
-        "hourly_profile_kw": hourly_profile_kw,
-        "source": "actual_hourly_usage",
-    }
-
-def select_15min_view_if_available(driver, by, logs, label):
-    try:
-        radio_selectors = [
-            (by.XPATH, "//label[contains(normalize-space(.),'15분')]"),
-            (by.XPATH, "//span[contains(normalize-space(.),'15분')]"),
-            (by.XPATH, "//input[@type='radio' and contains(@onclick,'15') or @value='15']"),
-        ]
-        clicked = click_first(driver, radio_selectors, logs, f'{label} 15분 선택')
-        if clicked:
-            time.sleep(0.6)
-            search_selectors = [
-                (by.XPATH, "//button[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
-                (by.XPATH, "//a[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
-                (by.CSS_SELECTOR, "button"),
-            ]
-            click_first(driver, search_selectors, logs, f'{label} 조회 버튼')
-            time.sleep(1.2)
-    except Exception as e:
-        add_log(logs, f'{label} 15분 기준 설정 실패(무시): {e}')
-
-
-def extract_tariff_rates_from_tables(tables, season=None):
-    if not season:
-        season = month_to_season(datetime.now().month)
-
-    season_alias = {
-        "여름": ["여름", "여름철"],
-        "봄·가을": ["봄·가을", "봄/가을", "봄가을", "봄·가을철"],
-        "겨울": ["겨울", "겨울철"],
-    }
-
-    target_df = None
-    for df in tables:
-        sig = table_signature(df)
-        if all(x in sig for x in ["경부하", "중간부하", "최대부하"]):
-            target_df = df.copy()
-            break
-    if target_df is None:
-        return {}
-
-    target_df = target_df.copy().fillna("")
-    target_df.columns = [normalize_space(c) for c in target_df.columns]
-
-    basic_charge = 0.0
-    for col in target_df.columns:
-        if "기본요금" in col:
-            for v in target_df[col].tolist():
-                num = parse_number(v)
-                if num > 0:
-                    basic_charge = num
-                    break
-
-    season_col = None
-    for alias in season_alias.get(season, []):
-        for col in target_df.columns:
-            if alias in normalize_space(col):
-                season_col = col
-                break
-        if season_col:
-            break
-
-    if season_col is None:
-        for col in target_df.columns:
-            ncol = normalize_space(col)
-            if "봄" in ncol and "가을" in ncol:
-                season_col = col
-                break
-
-    time_col = None
-    for col in target_df.columns:
-        if "시간대" in normalize_space(col):
-            time_col = col
-            break
-    if time_col is None:
-        time_col = target_df.columns[1] if len(target_df.columns) > 1 else target_df.columns[0]
-
-    rates = {"basic_charge_unit": basic_charge, "off_peak_rate": 0.0, "mid_peak_rate": 0.0, "peak_rate": 0.0}
-    if season_col is None:
-        return rates
-
-    for _, row in target_df.iterrows():
-        time_name = normalize_space(row.get(time_col, ""))
-        rate = parse_number(row.get(season_col, 0))
-        if "경부하" in time_name:
-            rates["off_peak_rate"] = rate
-        elif "중간부하" in time_name:
-            rates["mid_peak_rate"] = rate
-        elif "최대부하" in time_name:
-            rates["peak_rate"] = rate
-
-    return rates
-
-
-def parse_hour_value(hour_text):
-    m = re.search(r"(\d{1,2})", str(hour_text or ""))
-    if not m:
-        return None
-    hour = int(m.group(1))
-    if hour == 24:
-        return 0
-    if 0 <= hour <= 23:
-        return hour
-    return None
-
-
-def extract_hourly_usage_map_from_tables(tables):
-    hourly = {}
-    for df in tables:
-        sig = table_signature(df)
-        if "시" not in sig:
-            continue
-
-        work = df.copy().fillna("")
-        try:
-            if isinstance(work.columns, pd.MultiIndex):
-                work.columns = [normalize_space(" ".join([str(x) for x in col if str(x) != "nan"])) for col in work.columns]
-            else:
-                work.columns = [normalize_space(c) for c in work.columns]
-        except Exception:
-            work.columns = [normalize_space(c) for c in work.columns]
-
-        for _, row in work.iterrows():
-            values = [normalize_space(v) for v in row.tolist()]
-            for idx, cell in enumerate(values):
-                hour = parse_hour_value(cell)
-                if hour is None:
-                    continue
-                for j in range(idx + 1, min(idx + 4, len(values))):
-                    num = parse_number(values[j])
-                    if num > 0:
-                        hourly[hour] = max(hourly.get(hour, 0.0), num)
-                        break
-    return hourly
-
-
-def extract_hourly_usage_map_from_text(text):
-    hourly = {}
-    raw = str(text or "")
-    for line in raw.splitlines():
-        line = normalize_space(line)
-        if not line:
-            continue
-        pairs = re.findall(r"(?:(\d{1,2})[:시]?(?:00)?)\s+([0-9,]{2,}(?:\.\d+)?)", line)
-        for hour_txt, usage_txt in pairs:
-            hour = parse_hour_value(hour_txt)
-            usage = parse_number(usage_txt)
-            if hour is None or usage <= 0:
-                continue
-            hourly[hour] = max(hourly.get(hour, 0.0), usage)
-    return hourly
-
-
-def extract_pattern_hourly_map_from_text(text):
-    weekday = {}
-    holiday = {}
-    raw = str(text or "")
-    for line in raw.splitlines():
-        line = normalize_space(line)
-        m = re.match(r"^(\d{1,2})[:시]00\s+([0-9,]{2,}(?:\.\d+)?)\s+[0-9,\.]+\s+[0-9,\.]+\s+([0-9,]{2,}(?:\.\d+)?)", line)
-        if m:
-            hour = parse_hour_value(m.group(1))
-            if hour is None:
-                continue
-            weekday[hour] = parse_number(m.group(2))
-            holiday[hour] = parse_number(m.group(3))
-            continue
-        m2 = re.match(r"^(\d{1,2})\s+([0-9,]{2,}(?:\.\d+)?)\s+[0-9,\.]+\s+[0-9,\.]+\s+([0-9,]{2,}(?:\.\d+)?)", line)
-        if m2:
-            hour = parse_hour_value(m2.group(1))
-            if hour is None:
-                continue
-            weekday[hour] = parse_number(m2.group(2))
-            holiday[hour] = parse_number(m2.group(3))
-    mixed = {}
-    for h in sorted(set(weekday) | set(holiday)):
-        wd = weekday.get(h, 0.0)
-        hd = holiday.get(h, 0.0)
-        if wd > 0 and hd > 0:
-            mixed[h] = wd * 5.0 / 7.0 + hd * 2.0 / 7.0
-        elif wd > 0:
-            mixed[h] = wd
-        elif hd > 0:
-            mixed[h] = hd
-    return mixed
-
-
-def extract_latest_12_months_usage_from_tables(tables):
-    monthly_rows = []
-
-    for df in tables:
-        sig = table_signature(df)
-        if "당해(kWh)" in sig and "월" in sig:
-            work = df.copy().fillna("")
-            work.columns = [normalize_space(c) for c in work.columns]
-            month_col = None
-            usage_col = None
-            for col in work.columns:
-                ncol = normalize_space(col)
-                if ncol == "월" or "월" in ncol:
-                    month_col = col
-                if "당해" in ncol and "kWh" in ncol:
-                    usage_col = col
-            if month_col and usage_col:
-                for _, row in work.iterrows():
-                    month_text = normalize_space(row.get(month_col, ""))
-                    m = re.search(r"(\d{1,2})월", month_text)
-                    if not m:
-                        continue
-                    month = int(m.group(1))
-                    usage = parse_number(row.get(usage_col, 0))
-                    if usage > 1000:
-                        monthly_rows.append((month, usage))
-                if monthly_rows:
-                    monthly_rows.sort(key=lambda x: x[0], reverse=True)
-                    return sum(v for _, v in monthly_rows[:12])
-
-    for df in tables:
-        sig = table_signature(df)
-        if "사용량합계" in sig and "kWh" in sig:
-            work = df.copy().fillna("")
-            work.columns = [normalize_space(c) for c in work.columns]
-            for col in work.columns:
-                if "사용량합계" in normalize_space(col):
-                    for v in work[col].tolist():
-                        num = parse_number(v)
-                        if num > 1000:
-                            return num
-    return 0.0
-
-
-def extract_latest_12_months_usage_from_text(text):
-    raw = str(text or "")
-    monthly = []
-    for m in re.finditer(r"(\d{1,2})월(?:\([^\)]*\))?\s+([0-9,]+(?:\.\d+)?)", raw):
-        month = int(m.group(1))
-        usage = parse_number(m.group(2))
-        if usage > 1000:
-            monthly.append((month, usage))
-    if monthly:
-        dedup = {}
-        for month, usage in monthly:
-            dedup[month] = max(dedup.get(month, 0.0), usage)
-        rows = sorted(dedup.items(), key=lambda x: x[0], reverse=True)
-        return sum(v for _, v in rows[:12])
-
-    m = re.search(r"사용량합계\s*(?:\(kWh\))?\s*([0-9,]+(?:\.\d+)?)", raw)
-    if m:
-        return parse_number(m.group(1))
-    return 0.0
-
-
-def extract_yearly_usage_from_tables(tables):
-    rows = []
-    for df in tables:
-        sig = table_signature(df)
-        if "연도" in sig and "사용량(kWh)" in sig:
-            work = df.copy().fillna("")
-            work.columns = [normalize_space(c) for c in work.columns]
-            year_col = None
-            usage_col = None
-            for col in work.columns:
-                ncol = normalize_space(col)
-                if "연도" in ncol:
-                    year_col = col
-                if "사용량" in ncol and "kWh" in ncol:
-                    usage_col = col
-            if year_col and usage_col:
-                for _, row in work.iterrows():
-                    year_text = normalize_space(row.get(year_col, ""))
-                    m = re.search(r"(20\d{2})", year_text)
-                    if not m:
-                        continue
-                    year = int(m.group(1))
-                    usage = parse_number(row.get(usage_col, 0))
-                    if usage > 0:
-                        rows.append((year, usage))
-    if rows:
-        now_year = datetime.now().year
-        full_years = [(y, v) for y, v in rows if y < now_year]
-        target = sorted(full_years if full_years else rows, key=lambda x: x[0], reverse=True)[0]
-        return target[1]
-    return 0.0
-
-
-def extract_yearly_usage_from_text(text):
-    rows = []
-    raw = str(text or "")
-    for m in re.finditer(r"(20\d{2})년\s+([0-9,]+(?:\.\d+)?)", raw):
-        year = int(m.group(1))
-        usage = parse_number(m.group(2))
-        if usage > 0:
-            rows.append((year, usage))
-    if rows:
-        now_year = datetime.now().year
-        full_years = [(y, v) for y, v in rows if y < now_year]
-        target = sorted(full_years if full_years else rows, key=lambda x: x[0], reverse=True)[0]
-        return target[1]
-    return 0.0
-
-
-def extract_max_demand_from_tables(tables):
-    candidates = []
-    for df in tables:
-        sig = table_signature(df)
-        if "최대수요" not in sig:
-            continue
-        work = df.copy().fillna("")
-        work.columns = [normalize_space(c) for c in work.columns]
-        md_cols = [col for col in work.columns if "최대수요" in normalize_space(col) and "kW" in normalize_space(col)]
-        for md_col in md_cols:
-            for v in work[md_col].tolist():
-                num = parse_number(v)
-                if num > 0:
-                    candidates.append(num)
-    return max(candidates) if candidates else 0.0
-
-
-def extract_max_demand_from_text(text):
-    raw = str(text or "")
-    patterns = [
-        r"최대수요전력\s*[:：]?\s*([0-9,]+(?:\.\d+)?)\s*kW",
-        r"최대수요\s*\(kW\)\s*([0-9,]+(?:\.\d+)?)",
-        r"최대\s*\(kW\)\s*([0-9,]+(?:\.\d+)?)",
-        r"최대수요\s*([0-9,]+(?:\.\d+)?)\s*kW",
-    ]
-    values = []
-    for pattern in patterns:
-        for m in re.finditer(pattern, raw, re.IGNORECASE):
-            num = parse_number(m.group(1))
-            if num > 0:
-                values.append(num)
-    return max(values) if values else 0.0
-
-
-def visit_powerplanner_page(driver, wait, by, url, logs, label, ready_patterns=None, post_load=None):
-    driver.get(url)
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-    wait.until(lambda d: len(d.find_elements(by.TAG_NAME, "body")) > 0)
-    time.sleep(1.2)
-
-    if callable(post_load):
-        try:
-            post_load(driver, by, logs, label)
-            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-            time.sleep(0.8)
-        except Exception as e:
-            add_log(logs, f"{label} 후처리 실패(무시): {e}")
-
-    if ready_patterns:
-        body_text = driver.find_element(by.TAG_NAME, "body").text
-        for pattern in ready_patterns:
-            if pattern and pattern not in body_text:
-                add_log(logs, f"{label} 화면 로드 후 확인문구 미일치: {pattern}")
-                break
-
-    html = driver.page_source
-    text = driver.find_element(by.TAG_NAME, "body").text
-    add_log(logs, f"{label} 화면 접속 완료")
-    return {"url": url, "html": html, "text": text}
-
-
-def scrape_smartview_page(page, result, logs):
-    text = page["text"]
-    tables = safe_read_html_tables(page["html"], logs=logs, label="스마트뷰")
-    pairs = extract_pairs_from_tables(tables)
-
-    contract_kind = pick_pair_value(pairs, ["적용전기요금", "계약종별"])
-    if not contract_kind:
-        contract_kind = extract_first_regex(
-            text,
-            [r"적용전기요금\s*([^\n]+)", r"적용전기요금\s*[:：]?\s*([^\n]+)"],
-        )
-    if contract_kind:
-        result["contract_kind"] = contract_kind
-
-    basic_charge = pick_pair_value(pairs, ["기본요금단가"])
-    if not basic_charge:
-        basic_charge = extract_first_regex(text, [r"기본요금단가\s*[:：]?\s*([0-9,\.]+)\s*원"])
-    if basic_charge:
-        result["basic_charge_unit"] = max(result["basic_charge_unit"], parse_number(basic_charge))
-
-    power_bill = pick_pair_value(pairs, ["요금적용전력"])
-    if not power_bill:
-        power_bill = extract_first_regex(text, [r"요금적용전력\s*[:：]?\s*([0-9,\.]+)\s*kW"])
-    if power_bill:
-        result["power_bill_kw"] = max(result["power_bill_kw"], parse_number(power_bill))
-
-    max_demand = pick_pair_value(pairs, ["최대수요전력"])
-    if not max_demand:
-        max_demand = extract_first_regex(text, [r"최대수요전력\s*[:：]?\s*([0-9,\.]+)\s*kW"])
-    if max_demand:
-        result["max_demand_kw"] = max(result["max_demand_kw"], parse_number(max_demand))
-
-    realtime_usage = extract_first_regex(
-        text,
-        [r"실시간사용량\s*([0-9,\.]+)\s*kWh", r"실시간 사용량\s*([0-9,\.]+)\s*kWh"],
-    )
-    if realtime_usage:
-        result["realtime_usage_kwh"] = parse_number(realtime_usage)
-
-    realtime_fee = extract_first_regex(
-        text,
-        [r"실시간요금\s*([0-9,\.]+)\s*원", r"실시간 요금은\s*([0-9,\.]+)\s*원"],
-    )
-    if realtime_fee:
-        result["yearly_bill_won"] = max(result.get("yearly_bill_won", 0.0), parse_number(realtime_fee))
-
-    current_season = month_to_season(datetime.now().month)
-    rates = extract_tariff_rates_from_tables(tables, season=current_season)
-    if rates:
-        if rates.get("basic_charge_unit", 0) > 0 and result["basic_charge_unit"] <= 0:
-            result["basic_charge_unit"] = rates["basic_charge_unit"]
-        result["off_peak_rate"] = max(result["off_peak_rate"], rates.get("off_peak_rate", 0.0))
-        result["mid_peak_rate"] = max(result["mid_peak_rate"], rates.get("mid_peak_rate", 0.0))
-        result["peak_rate"] = max(result["peak_rate"], rates.get("peak_rate", 0.0))
-
-    add_log(logs, "스마트뷰 요약값 해석 완료")
-
-
-def scrape_customer_info_page(page, result, logs):
-    text = page["text"]
-    tables = safe_read_html_tables(page["html"], logs=logs, label="고객정보")
-    pairs = extract_pairs_from_tables(tables)
-
-    contract_kind = pick_pair_value(pairs, ["계약종별"])
-    if contract_kind:
-        result["contract_kind"] = contract_kind
-
-    contract_power = pick_pair_value(pairs, ["계약전력"])
-    if contract_power:
-        result["contract_power_kw"] = parse_number(contract_power)
-
-    supply_text = pick_pair_value(pairs, ["공급방식"])
-    if supply_text:
-        result["supply_voltage_text"] = supply_text
-
-    meter_read_text = pick_pair_value(pairs, ["검침일"])
-    if meter_read_text:
-        m = re.search(r"(\d{1,2})", meter_read_text)
-        if m:
-            result["meter_read_day"] = int(m.group(1))
-
-    if not result["contract_kind"]:
-        result["contract_kind"] = extract_first_regex(text, [r"계약종별\s*([^\n]+)"])
-    if result["contract_power_kw"] <= 0:
-        result["contract_power_kw"] = parse_number(extract_first_regex(text, [r"계약전력\s*([0-9,\.]+\s*kw)"]))
-    if not result["supply_voltage_text"]:
-        result["supply_voltage_text"] = extract_first_regex(text, [r"공급방식\s*([^\n]+)"])
-
-    voltage_class = classify_voltage_from_contract_kind(result.get("contract_kind", ""), result.get("supply_voltage_text", ""))
-    result["voltage_class"] = voltage_class or result.get("voltage_class", "")
-    result["primary_voltage_kv"] = primary_voltage_from_class(result["voltage_class"], result.get("supply_voltage_text", ""))
-    add_log(logs, "고객정보 해석 완료")
-
-
-
-def scrape_hourly_usage_page(page, result, logs):
-    tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별 사용량")
-    hourly_map = extract_hourly_usage_map_from_tables(tables)
-    if len(hourly_map) < 6:
-        hourly_map = extract_hourly_usage_map_from_text(page["text"])
-    if hourly_map:
-        band_summary = summarize_band_loads_from_hourly(hourly_map, month_to_season(datetime.now().month))
-        if not band_summary:
-            band_summary = summarize_band_loads_from_hourly(hourly_map, "봄·가을")
-        if band_summary:
-            result["auto_avg_base_kw"] = band_summary["base_avg_kw"]
-            result["auto_off_peak_kw"] = band_summary["off_peak_kw"]
-            result["auto_mid_peak_kw"] = band_summary["mid_peak_kw"]
-            result["auto_peak_kw"] = band_summary["peak_kw"]
-            result["auto_off_ratio"] = band_summary["off_ratio"]
-            result["auto_mid_ratio"] = band_summary["mid_ratio"]
-            result["auto_peak_ratio"] = band_summary["peak_ratio"]
-            result["hourly_profile_kw"] = band_summary.get("hourly_profile_kw", {})
-            result["auto_source"] = "usage_hourly"
-            add_log(logs, f"시간대별 사용량 기준 평균부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
-
-    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
-    if md > 0:
-        result["max_demand_kw"] = max(result["max_demand_kw"], md)
-
-def scrape_daily_usage_page(page, result, logs):
-    tables = safe_read_html_tables(page["html"], logs=logs, label="일별 사용량")
-    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
-    if md > 0:
-        result["max_demand_kw"] = max(result["max_demand_kw"], md)
-        add_log(logs, f"일별 사용량에서 최대수요 후보 반영: {md:,.1f} kW")
-
-
-def scrape_monthly_usage_page(page, result, logs):
-    tables = safe_read_html_tables(page["html"], logs=logs, label="월별 사용량")
-    annual_usage = extract_latest_12_months_usage_from_tables(tables)
-    if annual_usage <= 0:
-        annual_usage = extract_latest_12_months_usage_from_text(page["text"])
-    if annual_usage > 1000:
-        result["annual_usage_kwh"] = max(result["annual_usage_kwh"], annual_usage)
-        add_log(logs, f"월별 사용량에서 최근 합계 반영: {annual_usage:,.1f} kWh")
-
-    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
-    if md > 0:
-        result["max_demand_kw"] = max(result["max_demand_kw"], md)
-
-
-def scrape_yearly_usage_page(page, result, logs):
-    tables = safe_read_html_tables(page["html"], logs=logs, label="연도별 사용량")
-    annual_usage = extract_yearly_usage_from_tables(tables)
-    if annual_usage <= 0:
-        annual_usage = extract_yearly_usage_from_text(page["text"])
-    if annual_usage > 0 and result["annual_usage_kwh"] <= 0:
-        result["annual_usage_kwh"] = annual_usage
-        add_log(logs, f"연도별 사용량에서 최근 연간 사용량 반영: {annual_usage:,.1f} kWh")
-
-    md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
-    if md > 0:
-        result["max_demand_kw"] = max(result["max_demand_kw"], md)
-
-
-
-
-def scrape_pattern_hourly_page(page, result, logs):
-    hourly_map = extract_pattern_hourly_map_from_text(page.get("text", ""))
-    if not hourly_map:
-        hourly_map = extract_hourly_usage_map_from_text(page.get("text", ""))
-    if not hourly_map:
-        tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별 패턴")
-        hourly_map = extract_hourly_usage_map_from_tables(tables)
-
-    # 실제 시간대별 사용량에서 이미 자동 산출을 성공했다면 패턴 페이지는 보조 정보로만 둔다.
-    if result.get("auto_source") == "usage_hourly" and result.get("auto_avg_base_kw", 0) > 0:
-        add_log(logs, "시간대별 패턴은 보조 정보로만 확인하고, 기준 평균부하는 시간대별 사용량 값을 유지합니다.")
-        return
-
-    if hourly_map:
-        season = month_to_season(datetime.now().month)
-        band_summary = summarize_band_loads_from_hourly(hourly_map, season)
-        if not band_summary:
-            band_summary = summarize_band_loads_from_hourly(hourly_map, "봄·가을")
-        if band_summary:
-            result["auto_avg_base_kw"] = band_summary["base_avg_kw"]
-            result["auto_off_peak_kw"] = band_summary["off_peak_kw"]
-            result["auto_mid_peak_kw"] = band_summary["mid_peak_kw"]
-            result["auto_peak_kw"] = band_summary["peak_kw"]
-            result["auto_off_ratio"] = band_summary["off_ratio"]
-            result["auto_mid_ratio"] = band_summary["mid_ratio"]
-            result["auto_peak_ratio"] = band_summary["peak_ratio"]
-            result["hourly_profile_kw"] = band_summary.get("hourly_profile_kw", {})
-            result["auto_source"] = "pattern_hourly"
-            add_log(logs, f"시간대별 패턴 기준 평균부하 자동 산출 성공: 평균 {band_summary['base_avg_kw']:.1f} kW")
-
-def scrape_realtime_charge_page(page, result, logs):
-    text = page["text"]
-    tables = safe_read_html_tables(page["html"], logs=logs, label="실시간·예상요금")
-    pairs = extract_pairs_from_tables(tables)
-
-    contract_kind = pick_pair_value(pairs, ["적용전기요금"])
-    if not contract_kind:
-        contract_kind = extract_first_regex(text, [r"적용전기요금\s*[:：]?\s*([^\n]+)"])
-    if contract_kind:
-        result["contract_kind"] = contract_kind
-
-    basic_charge = pick_pair_value(pairs, ["기본요금"])
-    if not basic_charge:
-        basic_charge = extract_first_regex(text, [r"기본요금\s*[:：]?\s*([0-9,\.]+)\s*원"])
-    if basic_charge and result["basic_charge_unit"] <= 0:
-        result["basic_charge_unit"] = parse_number(basic_charge)
-
-    realtime_fee = extract_first_regex(text, [r"실시간 요금은\s*([0-9,\.]+)\s*원", r"실시간요금\s*([0-9,\.]+)\s*원"])
-    if realtime_fee:
-        result["yearly_bill_won"] = max(result["yearly_bill_won"], parse_number(realtime_fee))
-
-    current_season = month_to_season(datetime.now().month)
-    rates = extract_tariff_rates_from_tables(tables, season=current_season)
-    if rates:
-        result["off_peak_rate"] = max(result["off_peak_rate"], rates.get("off_peak_rate", 0.0))
-        result["mid_peak_rate"] = max(result["mid_peak_rate"], rates.get("mid_peak_rate", 0.0))
-        result["peak_rate"] = max(result["peak_rate"], rates.get("peak_rate", 0.0))
-        if result["basic_charge_unit"] <= 0:
-            result["basic_charge_unit"] = rates.get("basic_charge_unit", 0.0)
-
-    add_log(logs, "실시간·예상요금 해석 완료")
-
-
-def scrape_timeband_charge_page(page, result, logs):
-    tables = safe_read_html_tables(page["html"], logs=logs, label="시간대별요금")
-    current_season = month_to_season(datetime.now().month)
-    rates = extract_tariff_rates_from_tables(tables, season=current_season)
-    if rates:
-        result["off_peak_rate"] = max(result["off_peak_rate"], rates.get("off_peak_rate", 0.0))
-        result["mid_peak_rate"] = max(result["mid_peak_rate"], rates.get("mid_peak_rate", 0.0))
-        result["peak_rate"] = max(result["peak_rate"], rates.get("peak_rate", 0.0))
-        add_log(logs, "시간대별 요금 단가 해석 완료")
-
-
+# =========================================================
+# 파워플래너 추출 함수
+# =========================================================
 def scrape_kepco_power_planner(user_id, user_pw):
     logs = []
 
@@ -1589,10 +504,21 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "logs": "실행 파이썬: {0}\nselenium 모듈 없음".format(sys.executable),
         }
 
+    if not has_module("webdriver_manager"):
+        return {
+            "status": "error",
+            "message": "현재 실행 중인 Python에 webdriver-manager가 설치되어 있지 않습니다.",
+            "logs": "실행 파이썬: {0}\nwebdriver_manager 모듈 없음".format(sys.executable),
+        }
+
     try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.options import Options
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
+        from webdriver_manager.chrome import ChromeDriverManager
     except Exception as e:
         return {
             "status": "error",
@@ -1602,20 +528,19 @@ def scrape_kepco_power_planner(user_id, user_pw):
 
     driver = None
     try:
-        env_info = get_runtime_environment_summary()
-        add_log(logs, "실행 파이썬: {0}".format(env_info["python"]))
-        add_log(logs, "플랫폼: {0}".format(env_info["platform"]))
-        add_log(logs, "chrome path: {0}".format(env_info["chrome_path"]))
-        add_log(logs, "chrome version: {0}".format(env_info["chrome_version"]))
-        add_log(logs, "chromedriver path: {0}".format(env_info["chromedriver_path"]))
-        add_log(logs, "chromedriver version: {0}".format(env_info["chromedriver_version"]))
+        options = Options()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
 
-        driver = build_chrome_driver(logs)
-        wait = WebDriverWait(driver, 30)
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        wait = WebDriverWait(driver, 20)
 
         login_url = "https://pp.kepco.co.kr/intro.do"
         driver.get(login_url)
         add_log(logs, "로그인 페이지 접속")
+
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text']")))
 
         id_selectors = [
@@ -1631,9 +556,9 @@ def scrape_kepco_power_planner(user_id, user_pw):
             (By.ID, "pw"),
         ]
         login_btn_selectors = [
-            (By.XPATH, "//button[contains(., '로그인')]") ,
-            (By.XPATH, "//a[contains(., '로그인')]") ,
-            (By.XPATH, "//input[@value='로그인']") ,
+            (By.XPATH, "//button[contains(., '로그인')]"),
+            (By.XPATH, "//a[contains(., '로그인')]"),
+            (By.XPATH, "//input[@value='로그인']"),
             (By.CSS_SELECTOR, "button"),
             (By.CSS_SELECTOR, "a.btn_login"),
             (By.CSS_SELECTOR, "input[type='submit']"),
@@ -1641,8 +566,13 @@ def scrape_kepco_power_planner(user_id, user_pw):
 
         id_box = find_first(driver, id_selectors)
         pw_box = find_first(driver, pw_selectors)
+
         if id_box is None or pw_box is None:
-            return {"status": "error", "message": "아이디 또는 비밀번호 입력창을 찾지 못했습니다.", "logs": "\n".join(logs)}
+            return {
+                "status": "error",
+                "message": "아이디 또는 비밀번호 입력창을 찾지 못했습니다.",
+                "logs": "\n".join(logs),
+            }
 
         id_box.clear()
         id_box.send_keys(user_id)
@@ -1650,12 +580,20 @@ def scrape_kepco_power_planner(user_id, user_pw):
         pw_box.send_keys(user_pw)
         add_log(logs, "아이디/비밀번호 입력 완료")
 
-        if not click_first(driver, login_btn_selectors, logs, "로그인 버튼"):
-            return {"status": "error", "message": "로그인 버튼 selector를 찾지 못했습니다.", "logs": "\n".join(logs)}
+        login_clicked = click_first(driver, login_btn_selectors, logs, "로그인 버튼")
+        if not login_clicked:
+            return {
+                "status": "error",
+                "message": "로그인 버튼 selector를 찾지 못했습니다.",
+                "logs": "\n".join(logs),
+            }
 
-        wait.until(lambda d: "Logout" in d.page_source or "스마트뷰" in d.page_source or "고객정보" in d.page_source)
-        time.sleep(2)
-        add_log(logs, "로그인 성공 및 메인 진입 확인")
+        time.sleep(3)
+
+        if "logout" in driver.page_source.lower():
+            add_log(logs, "로그인 성공 추정")
+        else:
+            add_log(logs, "로그인 성공 여부 확실하지 않음")
 
         result = {
             "contract_kind": "",
@@ -1666,169 +604,141 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "off_peak_rate": 0.0,
             "mid_peak_rate": 0.0,
             "peak_rate": 0.0,
-            "primary_voltage_kv": 22.9,
+            "primary_voltage_kv": 154.0,
             "contract_power_kw": 0.0,
             "supply_voltage_text": "",
-            "meter_read_day": 0,
             "yearly_bill_won": 0.0,
-            "voltage_class": "",
-            "auto_avg_base_kw": 0.0,
-            "auto_off_peak_kw": 0.0,
-            "auto_mid_peak_kw": 0.0,
-            "auto_peak_kw": 0.0,
-            "auto_off_ratio": 0.0,
-            "auto_mid_ratio": 0.0,
-            "auto_peak_ratio": 0.0,
-            "hourly_profile_kw": {},
-            "auto_source": "",
         }
 
-        pages_to_visit = [
-            {
-                "label": "스마트뷰",
-                "url": "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101",
-                "ready": ["스마트뷰", "실시간사용량"],
-                "parser": scrape_smartview_page,
-            },
-            {
-                "label": "고객정보",
-                "url": "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601",
-                "ready": ["고객정보", "계약종별"],
-                "parser": scrape_customer_info_page,
-            },
-            {
-                "label": "시간대별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0101N.do?menu_id=O010201",
-                "ready": ["시간대별", "사용량"],
-                "post_load": select_15min_view_if_available,
-                "parser": scrape_hourly_usage_page,
-            },
-            {
-                "label": "시간대별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
-                "ready": ["시간대별", "패턴기간"],
-                "post_load": select_15min_view_if_available,
-                "parser": scrape_pattern_hourly_page,
-            },
-            {
-                "label": "일별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0102.do?menu_id=O010202",
-                "ready": ["일별", "사용량"],
-                "parser": scrape_daily_usage_page,
-            },
-            {
-                "label": "월별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0103.do?menu_id=O010203",
-                "ready": ["월별", "사용량"],
-                "parser": scrape_monthly_usage_page,
-            },
-            {
-                "label": "연도별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204",
-                "ready": ["연도별", "사용량"],
-                "parser": scrape_yearly_usage_page,
-            },
-            {
-                "label": "요일별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0102.do?menu_id=O010302",
-                "ready": ["요일별", "패턴기간"],
-                "parser": None,
-            },
-            {
-                "label": "월별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0103.do?menu_id=O010303",
-                "ready": ["월별", "패턴기간"],
-                "parser": None,
-            },
-            {
-                "label": "실시간·예상요금",
-                "url": "https://pp.kepco.co.kr/pr/pr0101.do?menu_id=O010401",
-                "ready": ["실시간", "예상"],
-                "parser": scrape_realtime_charge_page,
-            },
-            {
-                "label": "시간대별요금",
-                "url": "https://pp.kepco.co.kr/re/re0102.do?menu_id=O010402",
-                "ready": ["시간대별", "요금"],
-                "parser": scrape_timeband_charge_page,
-            },
-        ]
+        smartview_url = "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101"
+        driver.get(smartview_url)
+        time.sleep(2)
+        add_log(logs, "스마트뷰 화면 이동")
 
-        for page_meta in pages_to_visit:
-            try:
-                page = visit_powerplanner_page(
-                    driver=driver,
-                    wait=wait,
-                    by=By,
-                    url=page_meta["url"],
-                    logs=logs,
-                    label=page_meta["label"],
-                    ready_patterns=page_meta.get("ready"),
-                    post_load=page_meta.get("post_load"),
-                )
-                parser = page_meta.get("parser")
-                if parser is not None:
-                    parser(page, result, logs)
-            except Exception as page_error:
-                add_log(logs, f"{page_meta['label']} 처리 실패: {page_error}")
-                add_log(logs, traceback.format_exc())
+        smart_text = driver.find_element(By.TAG_NAME, "body").text
+        patterns = {
+            "contract_kind": r"적용전기요금\s*([^\n]+)",
+            "basic_charge_unit": r"기본요금단가\s*([\d,\.]+)\s*원",
+            "power_bill_kw": r"요금적용전력\s*([\d,\.]+)\s*kW",
+            "max_demand_kw": r"최대수요전력\s*([\d,\.]+)\s*kW",
+        }
 
-        if not result["voltage_class"]:
-            result["voltage_class"] = classify_voltage_from_contract_kind(result.get("contract_kind", ""), result.get("supply_voltage_text", ""))
+        for key, pattern in patterns.items():
+            m = re.search(pattern, smart_text)
+            if m:
+                if key == "contract_kind":
+                    result[key] = m.group(1).strip()
+                else:
+                    result[key] = parse_number(m.group(1))
+                add_log(logs, "{0} 추출 성공".format(key))
+            else:
+                add_log(logs, "{0} 추출 실패".format(key))
+
+        customer_url = "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601"
+        driver.get(customer_url)
+        time.sleep(2)
+        add_log(logs, "고객정보 화면 이동")
+        customer_text = driver.find_element(By.TAG_NAME, "body").text
+
+        m = re.search(r"계약종별\s*([^\n]+)", customer_text)
+        if m:
+            result["contract_kind"] = m.group(1).strip()
+            add_log(logs, "고객정보 계약종별 추출 성공")
+
+        m = re.search(r"계약전력\s*([\d,\.]+)\s*kw", customer_text, re.IGNORECASE)
+        if m:
+            result["contract_power_kw"] = parse_number(m.group(1))
+            add_log(logs, "고객정보 계약전력 추출 성공")
+
+        m = re.search(r"공급방식\s*([^\n]+)", customer_text)
+        if m:
+            result["supply_voltage_text"] = m.group(1).strip()
+            kv = parse_voltage_from_text(result["supply_voltage_text"])
+            if kv > 0:
+                result["primary_voltage_kv"] = kv
+            add_log(logs, "고객정보 공급방식 추출 성공")
+
+        usage_url = "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204"
+        driver.get(usage_url)
+        time.sleep(3)
+        add_log(logs, "연도별 전력사용량 화면 이동")
+
+        usage_text = driver.find_element(By.TAG_NAME, "body").text
+        usage_rows = []
+        pattern_usage = re.compile(r"(20\d{2})년\s*([\d,\.]+)\s*([\d,\.]+)", re.MULTILINE)
+        for m in pattern_usage.finditer(usage_text):
+            usage_rows.append({
+                "year": int(m.group(1)),
+                "usage_kwh": parse_number(m.group(2)),
+                "max_kw": parse_number(m.group(3)),
+            })
+
+        if usage_rows:
+            latest_full = choose_latest_full_year(usage_rows)
+            if latest_full:
+                result["annual_usage_kwh"] = latest_full["usage_kwh"]
+                if result["max_demand_kw"] <= 0:
+                    result["max_demand_kw"] = latest_full["max_kw"]
+                add_log(logs, "연도별 전력사용량 추출 성공: {0}".format(latest_full))
+        else:
+            add_log(logs, "연도별 전력사용량 추출 실패")
+
+        bill_url = "https://pp.kepco.co.kr/cc/cc0104.do?menu_id=O010406"
+        driver.get(bill_url)
+        time.sleep(2)
+        add_log(logs, "연도별 청구요금 화면 이동")
+
+        bill_text = driver.find_element(By.TAG_NAME, "body").text
+        bill_rows = []
+        pattern_bill = re.compile(r"(20\d{2})년\s*([\d,\.]+)\s*([\d,\.]+)", re.MULTILINE)
+        for m in pattern_bill.finditer(bill_text):
+            bill_rows.append({
+                "year": int(m.group(1)),
+                "bill_won": parse_number(m.group(2)),
+                "usage_kwh": parse_number(m.group(3)),
+            })
+
+        if bill_rows:
+            latest_full_bill = choose_latest_full_year(bill_rows)
+            if latest_full_bill:
+                result["yearly_bill_won"] = latest_full_bill["bill_won"]
+                if result["annual_usage_kwh"] <= 0:
+                    result["annual_usage_kwh"] = latest_full_bill["usage_kwh"]
+                add_log(logs, "연도별 청구요금 추출 성공: {0}".format(latest_full_bill))
+        else:
+            add_log(logs, "연도별 청구요금 추출 실패")
+
         if result["primary_voltage_kv"] <= 0:
-            result["primary_voltage_kv"] = primary_voltage_from_class(result["voltage_class"], result.get("supply_voltage_text", ""))
-        if not result["supply_voltage_text"]:
-            result["supply_voltage_text"] = describe_voltage_class(result["voltage_class"], result["primary_voltage_kv"])
+            result["primary_voltage_kv"] = 154.0
 
-        if result["annual_usage_kwh"] <= 0 and result["auto_avg_base_kw"] > 0:
-            result["annual_usage_kwh"] = result["auto_avg_base_kw"] * 24 * 365
-            add_log(logs, "연간 사용량이 없어 시간대 평균부하 기준으로 보정했습니다.")
+        if result["off_peak_rate"] <= 0 or result["mid_peak_rate"] <= 0 or result["peak_rate"] <= 0:
+            voltage_class = get_voltage_class(result["primary_voltage_kv"])
+            fallback = safe_rate_table(voltage_class)
+            result["off_peak_rate"] = fallback["봄·가을"]["경부하"]
+            result["mid_peak_rate"] = fallback["봄·가을"]["중간부하"]
+            result["peak_rate"] = fallback["봄·가을"]["최대부하"]
+            add_log(logs, "단가표 fallback 적용")
 
-        if result["contract_power_kw"] <= 0 and result["power_bill_kw"] > 0:
-            result["contract_power_kw"] = result["power_bill_kw"]
-        if result["power_bill_kw"] <= 0 and result["max_demand_kw"] > 0:
-            result["power_bill_kw"] = result["max_demand_kw"]
-
-        success_score = 0
-        for key in [
-            "contract_kind",
-            "basic_charge_unit",
-            "power_bill_kw",
-            "max_demand_kw",
-            "annual_usage_kwh",
-            "off_peak_rate",
-            "mid_peak_rate",
-            "peak_rate",
-            "contract_power_kw",
-            "auto_avg_base_kw",
-        ]:
-            value = result.get(key)
-            if isinstance(value, str) and value.strip():
-                success_score += 1
-            elif isinstance(value, (int, float)) and value > 0:
-                success_score += 1
-
-        if result.get("auto_avg_base_kw", 0.0) <= 0:
-            add_log(logs, "평균부하 자동 산출 실패: 시간대별 사용량/패턴 표에서 사업장별 값을 확정하지 못했습니다.")
-        if success_score < 5:
-            return {
-                "status": "error",
-                "message": "파워플래너 화면은 열렸지만 필요한 값 추출이 충분하지 않습니다. 자동화 로그를 확인해 주세요.",
-                "logs": "\n".join(logs),
-                **result,
-            }
-
-        add_log(logs, f"최종 추출 성공 점수: {success_score}/10")
         return {
             "status": "success",
-            "message": "파워플래너 화면 기준 값 추출을 완료했습니다.",
+            "message": "파워플래너 값 추출을 완료했습니다.",
             "logs": "\n".join(logs),
-            **result,
+            "contract_kind": result["contract_kind"],
+            "basic_charge_unit": result["basic_charge_unit"],
+            "power_bill_kw": result["power_bill_kw"],
+            "max_demand_kw": result["max_demand_kw"],
+            "annual_usage_kwh": result["annual_usage_kwh"],
+            "off_peak_rate": result["off_peak_rate"],
+            "mid_peak_rate": result["mid_peak_rate"],
+            "peak_rate": result["peak_rate"],
+            "primary_voltage_kv": result["primary_voltage_kv"],
+            "contract_power_kw": result["contract_power_kw"],
+            "supply_voltage_text": result["supply_voltage_text"],
+            "yearly_bill_won": result["yearly_bill_won"],
         }
 
     except Exception as e:
         add_log(logs, "예외 발생: {0}".format(str(e)))
-        add_log(logs, traceback.format_exc())
         return {
             "status": "error",
             "message": "자동화 중 오류 발생: {0}".format(str(e)),
@@ -1842,40 +752,6 @@ def scrape_kepco_power_planner(user_id, user_pw):
                 pass
 
 
-
-def find_first(driver, selectors):
-    for by, selector in selectors:
-        try:
-            elems = driver.find_elements(by, selector)
-            for elem in elems:
-                try:
-                    if elem.is_displayed():
-                        return elem
-                except Exception:
-                    return elem
-        except Exception:
-            continue
-    return None
-
-
-def click_first(driver, selectors, logs=None, label="요소"):
-    for by, selector in selectors:
-        try:
-            elems = driver.find_elements(by, selector)
-            for elem in elems:
-                try:
-                    driver.execute_script("arguments[0].click();", elem)
-                    if logs is not None:
-                        add_log(logs, f"{label} 클릭 성공: {selector}")
-                    return True
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    if logs is not None:
-        add_log(logs, f"{label} 클릭 실패")
-    return False
-
 # =========================================================
 # PDF 생성 함수
 # =========================================================
@@ -1887,7 +763,6 @@ def build_pdf_bytes_report(
     primary_voltage_kv,
     secondary_voltage_v,
     new_voltage,
-    current_voltage_for_calc,
     voltage_drop_pct,
     voltage_drop_v,
     primary_voltage_class,
@@ -1929,10 +804,7 @@ def build_pdf_bytes_report(
     fig_bar_buf,
 ):
     buffer = io.BytesIO()
-    global CURRENT_PDF_FONT_NAME
-    font_info = get_korean_font_info()
-    font_name = font_info["pdf_name"]
-    CURRENT_PDF_FONT_NAME = font_name
+    font_name = get_pdf_font_name()
 
     doc = SimpleDocTemplate(
         buffer,
@@ -1980,6 +852,8 @@ def build_pdf_bytes_report(
 
     elements = []
 
+    base_voltage_kv = secondary_voltage_v / 1000.0 if calc_voltage_basis == "2차측 전압 사용" else primary_voltage_kv
+
     # 1페이지
     elements.append(Paragraph("CVR 운영형 계산 결과 보고서", styles["KTitle"]))
     elements.append(
@@ -2025,12 +899,10 @@ def build_pdf_bytes_report(
         ["탭 1스텝당 전압 변화율", f"{tap_step_percent:.2f} %"],
     ]
     cond_tbl = Table(
-        [
-            [
-                make_two_col_table(cond_left, col_widths=[38*mm, 50*mm], font_name=font_name, font_size=8.5),
-                make_two_col_table(cond_right, col_widths=[38*mm, 50*mm], font_name=font_name, font_size=8.5),
-            ]
-        ],
+        [[
+            make_two_col_table(cond_left, col_widths=[38*mm, 50*mm], font_name=font_name, font_size=8.5),
+            make_two_col_table(cond_right, colWidths=[38*mm, 50*mm] if False else [38*mm, 50*mm], font_name=font_name, font_size=8.5),
+        ]],
         colWidths=[88*mm, 88*mm],
     )
     cond_tbl.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
@@ -2038,15 +910,12 @@ def build_pdf_bytes_report(
     elements.append(Spacer(1, 8))
 
     elements.append(Paragraph("3. 현재안 / 제안안 비교", styles["KHeading"]))
-    current_voltage_display_kv = current_voltage_for_calc / 1000.0
-    proposed_voltage_display_kv = new_voltage / 1000.0
-
     current_vs_proposed = [
         ["구분", "현재", "제안", "기대 효과"],
         [
             "계산 기준 전압",
-            f"{current_voltage_display_kv:,.2f} kV",
-            f"{proposed_voltage_display_kv:,.2f} kV",
+            f"{base_voltage_kv:,.2f} kV",
+            f"{new_voltage / 1000.0:,.2f} kV",
             f"{voltage_drop_v:,.1f} V 저감",
         ],
         [
@@ -2264,21 +1133,12 @@ st.title("CVR 운영형 계산기")
 st.caption("실사용 및 미팅용 추정 화면입니다. 최종 적용 전에는 최신 계약요금표 및 실측 데이터 검토가 필요합니다.")
 
 with st.expander("실행 환경 확인", expanded=False):
-    font_info_debug = get_korean_font_info()
     st.write("현재 실행 중인 Python:", sys.executable)
     st.write("Python 버전:", sys.version)
     st.write("selenium 설치 여부:", "설치됨" if has_module("selenium") else "없음")
     st.write("webdriver_manager 설치 여부:", "설치됨" if has_module("webdriver_manager") else "없음")
     st.write("reportlab 설치 여부:", "설치됨" if has_module("reportlab") else "없음")
     st.write("matplotlib 설치 여부:", "설치됨" if has_module("matplotlib") else "없음")
-    st.write("PDF 폰트:", font_info_debug["pdf_name"])
-    st.write("그래프 폰트:", font_info_debug["mpl_name"])
-    st.write("폰트 경로:", font_info_debug["font_path"] or "기본 폰트 사용")
-    env_info_debug = get_runtime_environment_summary()
-    st.write("Chrome 경로:", env_info_debug["chrome_path"])
-    st.write("Chrome 버전:", env_info_debug["chrome_version"])
-    st.write("ChromeDriver 경로:", env_info_debug["chromedriver_path"])
-    st.write("ChromeDriver 버전:", env_info_debug["chromedriver_version"])
 
     col_install_1, col_install_2, col_install_3, col_install_4 = st.columns(4)
 
@@ -2322,34 +1182,6 @@ with st.expander("실행 환경 확인", expanded=False):
                     st.error("matplotlib 설치 실패")
                 st.code("STDOUT:\n{0}\n\nSTDERR:\n{1}".format(out, err))
 
-
-st.markdown(
-    """
-    <style>
-    .pp-right-sticky {
-        position: -webkit-sticky;
-        position: sticky;
-        top: 72px;
-        align-self: flex-start;
-        height: fit-content;
-        max-height: calc(100vh - 90px);
-        overflow-y: auto;
-        padding-right: 4px;
-    }
-    @media (max-width: 980px) {
-        .pp-right-sticky {
-            position: static;
-            top: auto;
-            max-height: none;
-            overflow-y: visible;
-        }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
 left, right = st.columns([1.7, 1.0])
 
 
@@ -2367,14 +1199,14 @@ with left:
         "입력 방식",
         st.radio,
         "manual",
-        options=["파워플래너 자동반영", "파워플래너 값 수동 반영", "수동 입력"],
+        options=["수동 입력", "파워플래너 값 수동 반영", "Selenium 자동 값 추출"],
         horizontal=True,
-        index=0,
+        index=2,
     )
 
-    if pp_mode == "파워플래너 자동반영":
+    if pp_mode == "Selenium 자동 값 추출":
         with st.expander("파워플래너 계정 정보 입력", expanded=True):
-            st.warning("보안정책, 사이트 구조 변경, 로딩 지연에 따라 실패할 수 있습니다. 배포 서버에서는 chromium/chromedriver가 설치되어 있어야 자동화가 동작합니다.")
+            st.warning("보안정책, 사이트 구조 변경, 로딩 지연에 따라 실패할 수 있습니다.")
             col1, col2 = st.columns(2)
 
             with col1:
@@ -2404,17 +1236,7 @@ with left:
                             st.session_state["pp_primary_voltage_kv"] = result.get("primary_voltage_kv", 154.0)
                             st.session_state["pp_contract_power_kw"] = result.get("contract_power_kw", 0.0)
                             st.session_state["pp_supply_voltage_text"] = result.get("supply_voltage_text", "")
-                            st.session_state["pp_meter_read_day"] = result.get("meter_read_day", 0)
                             st.session_state["pp_yearly_bill_won"] = result.get("yearly_bill_won", 0.0)
-                            st.session_state["pp_voltage_class"] = result.get("voltage_class", "")
-                            st.session_state["pp_auto_avg_base_kw"] = result.get("auto_avg_base_kw", 0.0)
-                            st.session_state["pp_auto_off_peak_kw"] = result.get("auto_off_peak_kw", 0.0)
-                            st.session_state["pp_auto_mid_peak_kw"] = result.get("auto_mid_peak_kw", 0.0)
-                            st.session_state["pp_auto_peak_kw"] = result.get("auto_peak_kw", 0.0)
-                            st.session_state["pp_auto_off_ratio"] = result.get("auto_off_ratio", 0.0)
-                            st.session_state["pp_auto_mid_ratio"] = result.get("auto_mid_ratio", 0.0)
-                            st.session_state["pp_auto_peak_ratio"] = result.get("auto_peak_ratio", 0.0)
-                            st.session_state["pp_hourly_profile_kw"] = result.get("hourly_profile_kw", {})
                             st.success(result["message"])
                         else:
                             st.error(result["message"])
@@ -2522,10 +1344,9 @@ with left:
     avg_kw_from_annual = annual_kwh_to_avg_kw(st.session_state["pp_annual_usage_kwh"])
 
     if pp_loaded:
-        summary_avg_kw = st.session_state.get("pp_auto_avg_base_kw", 0.0) or avg_kw_from_annual
         st.success(
             "평균부하: {0:,.1f} kW / 계약종별: {1} / 공급방식: {2}".format(
-                summary_avg_kw,
+                avg_kw_from_annual,
                 st.session_state["pp_contract_kind"] or "-",
                 st.session_state.get("pp_supply_voltage_text", "-") or "-",
             )
@@ -2630,7 +1451,7 @@ with left:
             st.selectbox,
             "manual",
             options=list(range(24)),
-            index=9,
+            index=18,
             format_func=lambda x: "{0:02d}:00".format(x),
         )
 
@@ -2638,92 +1459,48 @@ with left:
     holiday_count = colored_input("연 공휴일 수", st.number_input, "manual", min_value=0, value=15, step=1)
 
     st.markdown("### 평균 부하 입력")
-    auto_ratio_ready = (
-        pp_mode == "파워플래너 자동반영"
-        and pp_loaded
-        and st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0
-    )
-
     input_mode = colored_input(
         "입력 방식",
         st.radio,
         "manual",
-        options=["직접 입력", "파워플래너 자동 산출"],
+        options=["직접 입력", "평균부하+비율 입력"],
         horizontal=True,
-        index=1 if auto_ratio_ready else 0,
+        index=1 if pp_loaded else 0,
     )
     load_unit = colored_input("입력 단위", st.radio, "manual", options=["kW", "MW"], horizontal=True, index=1)
     unit_mul = 1000.0 if load_unit == "MW" else 1.0
 
-    if input_mode == "파워플래너 자동 산출":
-        ratio_color = "auto" if auto_ratio_ready else "verify"
-
-        if auto_ratio_ready:
-            st.caption("파워플래너 시간대 평균부하를 기준으로 자동 산출되며, 필요 시 직접 수정할 수 있습니다.")
-            default_avg_kw = st.session_state.get("pp_auto_avg_base_kw", 0.0)
-            default_off_ratio = st.session_state.get("pp_auto_off_ratio", 1.0)
-            default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.0)
-            default_peak_ratio = st.session_state.get("pp_auto_peak_ratio", 1.0)
-        else:
-            st.warning("파워플래너 시간대별 평균부하 자동 산출값이 없어 기본값을 넣지 않았습니다. 자동반영을 다시 실행하거나 직접 입력으로 전환해 주세요.")
-            default_avg_kw = avg_kw_from_annual if pp_loaded and avg_kw_from_annual > 0 else 0.0
-            default_off_ratio = 1.0
-            default_mid_ratio = 1.0
-            default_peak_ratio = 1.0
-
+    if input_mode == "평균부하+비율 입력":
+        default_avg_kw = avg_kw_from_annual if pp_loaded and avg_kw_from_annual > 0 else 18000.0
         avg_base_input = colored_input(
             f"기준 평균부하({load_unit})",
             st.number_input,
-            ratio_color,
+            "manual",
             min_value=0.0,
             value=float(default_avg_kw / unit_mul),
-            step=0.1 if load_unit == "MW" else 100.0,
+            step=1.0 if load_unit == "MW" else 1000.0,
         )
         avg_base_kw = avg_base_input * unit_mul
 
         r1, r2, r3 = st.columns(3)
         with r1:
-            off_ratio = colored_input(
-                "경부하 비율",
-                st.number_input,
-                ratio_color,
-                min_value=0.10,
-                value=float(default_off_ratio or 1.0),
-                step=0.01,
-            )
+            off_ratio = colored_input("경부하 비율", st.number_input, "manual", min_value=0.10, value=0.92, step=0.01)
         with r2:
-            mid_ratio = colored_input(
-                "중간부하 비율",
-                st.number_input,
-                ratio_color,
-                min_value=0.10,
-                value=float(default_mid_ratio or 1.0),
-                step=0.01,
-            )
+            mid_ratio = colored_input("중간부하 비율", st.number_input, "manual", min_value=0.10, value=1.00, step=0.01)
         with r3:
-            peak_ratio = colored_input(
-                "최대부하 비율",
-                st.number_input,
-                ratio_color,
-                min_value=0.10,
-                value=float(default_peak_ratio or 1.0),
-                step=0.01,
-            )
+            peak_ratio = colored_input("최대부하 비율", st.number_input, "manual", min_value=0.10, value=1.10, step=0.01)
 
         auto_loads = avg_kw_to_timeband_loads(avg_base_kw, off_ratio, mid_ratio, peak_ratio)
         off_peak_kw = auto_loads["경부하"]
         mid_peak_kw = auto_loads["중간부하"]
         peak_kw = auto_loads["최대부하"]
     else:
-        default_off_kw = st.session_state.get("pp_auto_off_peak_kw", 0.0) if pp_loaded else 0.0
-        default_mid_kw = st.session_state.get("pp_auto_mid_peak_kw", 0.0) if pp_loaded else 0.0
-        default_peak_kw = st.session_state.get("pp_auto_peak_kw", 0.0) if pp_loaded else 0.0
         off_peak_kw = colored_input(
             f"경부하 평균부하({load_unit})",
             st.number_input,
             "manual",
             min_value=0.0,
-            value=float(default_off_kw / unit_mul),
+            value=16.0 if load_unit == "MW" else 16000.0,
             step=1.0 if load_unit == "MW" else 1000.0,
         ) * unit_mul
         mid_peak_kw = colored_input(
@@ -2731,7 +1508,7 @@ with left:
             st.number_input,
             "manual",
             min_value=0.0,
-            value=float(default_mid_kw / unit_mul),
+            value=18.0 if load_unit == "MW" else 18000.0,
             step=1.0 if load_unit == "MW" else 1000.0,
         ) * unit_mul
         peak_kw = colored_input(
@@ -2739,7 +1516,7 @@ with left:
             st.number_input,
             "manual",
             min_value=0.0,
-            value=float(default_peak_kw / unit_mul),
+            value=20.0 if load_unit == "MW" else 20000.0,
             step=1.0 if load_unit == "MW" else 1000.0,
         ) * unit_mul
 
@@ -2768,21 +1545,7 @@ loads_by_label = {
     "중간부하": mid_peak_kw,
     "최대부하": peak_kw,
 }
-if (
-    st.session_state["pp_loaded"]
-    and st.session_state["pp_off_peak_rate"] > 0
-    and st.session_state["pp_mid_peak_rate"] > 0
-    and st.session_state["pp_peak_rate"] > 0
-):
-    rate_table = {
-        season: {
-            "경부하": float(st.session_state["pp_off_peak_rate"]),
-            "중간부하": float(st.session_state["pp_mid_peak_rate"]),
-            "최대부하": float(st.session_state["pp_peak_rate"]),
-        }
-    }
-else:
-    rate_table = safe_rate_table(primary_voltage_class)
+rate_table = safe_rate_table(primary_voltage_class)
 tariff_voltage_class = primary_voltage_class
 
 rows = []
@@ -2850,30 +1613,11 @@ for h in range(24):
 hourly_df = pd.DataFrame(hour_rows)
 
 # 탭별 비교표
-max_compare_drop_pct = 7.5
+tap_candidates = sorted(set([1, 2, 3, 4, 5, 6, 7, int(current_tap), int(target_tap)]), reverse=True)
 tap_compare_rows = []
-current_tap_int = int(current_tap)
-
-# 현재 탭(기준점)도 함께 표시
-base_compare_voltage = current_voltage_for_calc
-base_compare_row = {
-    "탭": current_tap_int,
-    "계산 기준 전압(V)": round(base_compare_voltage, 1),
-    "전압 저감률(%)": 0.0,
-    "절감률(%)": 0.0,
-    "평균 절감전력(kW)": 0.0,
-    "일 절감량(kWh)": 0.0,
-    "연 절감량(kWh)": 0.0,
-    "일 절감요금(원)": 0.0,
-    "연 절감요금(원)": 0.0,
-}
-tap_compare_rows.append(base_compare_row)
-
-for tap in range(max(current_tap_int - 1, 1), 0, -1):
-    delta_steps = max(current_tap_int - int(tap), 0)
+for tap in tap_candidates:
+    delta_steps = max(int(current_tap - tap), 0)
     tap_voltage_drop_pct = calc_tap_voltage_change(tap_step_percent, delta_steps)
-    if tap_voltage_drop_pct < 1.25 or tap_voltage_drop_pct > max_compare_drop_pct:
-        continue
     tap_new_voltage = current_voltage_for_calc * (1 - tap_voltage_drop_pct / 100.0)
 
     tap_daily_saved_kwh = 0.0
@@ -2883,7 +1627,7 @@ for tap in range(max(current_tap_int - 1, 1), 0, -1):
         hours = operating_hour_count[label]
         load_kw = loads_by_label[label]
         rate = rate_table[season][label]
-        tap_saving_rate_pct, tap_saved_kw, tap_saved_kwh = calc_average_result(
+        _, _, tap_saved_kwh = calc_average_result(
             load_kw,
             tap_voltage_drop_pct,
             defaults["cvrf"],
@@ -2913,22 +1657,7 @@ for tap in range(max(current_tap_int - 1, 1), 0, -1):
     })
 
 tap_compare_df = pd.DataFrame(tap_compare_rows)
-if not tap_compare_df.empty:
-    tap_compare_df = tap_compare_df[
-        (tap_compare_df["탭"] == current_tap_int) |
-        (tap_compare_df["전압 저감률(%)"] == 0.0) |
-        (
-            (tap_compare_df["전압 저감률(%)"] >= 1.25) &
-            (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct)
-        )
-    ].copy()
-    tap_compare_df = tap_compare_df.drop_duplicates(subset=["탭"], keep="first")
-    tap_compare_df = tap_compare_df.sort_values(
-        by=["탭"],
-        ascending=[False]
-    ).reset_index(drop=True)
 
-# 요약 데이터프레임
 rate_summary_df = pd.DataFrame({
     "구분": ["경부하", "중간부하", "최대부하"],
     "요금(원/kWh)": [
@@ -2968,7 +1697,6 @@ created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 # 우측 결과 섹션
 # =========================================================
 with right:
-    st.markdown('<div class="pp-right-sticky">', unsafe_allow_html=True)
     logo_col1, logo_col2, logo_col3 = st.columns([1, 1, 1])
     with logo_col2:
         try:
@@ -2978,11 +1706,11 @@ with right:
 
     st.markdown("### 🎨 입력항목 색상 범례")
     st.markdown(
-        '<div style="background-color: #d4edda; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟩 연녹색: 파워플래너 자동반영</div>',
+        '<div style="background-color: #d4edda; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟩 연녹색: 파워플래너 정보 자동 적용</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div style="background-color: #fff3cd; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟨 연노랑: 파워플래너 자동반영 후 수동 검증 권장</div>',
+        '<div style="background-color: #fff3cd; padding: 6px; margin-bottom: 5px; border-radius: 5px; color: #333; font-weight: bold;">🟨 연노랑: 자동 적용되나 수동 검증 권장</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -3011,96 +1739,46 @@ with right:
     if st.session_state["pp_loaded"]:
         st.markdown("### 파워플래너 반영값")
         st.write("- 계약종별: **{0}**".format(st.session_state["pp_contract_kind"] or "-"))
-        st.write("- 전압등급: **{0}**".format(st.session_state.get("pp_voltage_class", "-") or "-"))
         st.write("- 기본요금단가: **{0:,.1f} 원/kW**".format(st.session_state["pp_basic_charge_unit"]))
         st.write("- 요금적용전력: **{0:,.1f} kW**".format(st.session_state["pp_power_bill_kw"]))
         st.write("- 최대수요전력: **{0:,.1f} kW**".format(st.session_state["pp_max_demand_kw"]))
-        st.write("- 최근 12개월 사용량: **{0:,.1f} kWh**".format(st.session_state["pp_annual_usage_kwh"]))
+        st.write("- 전년도 사용량: **{0:,.1f} kWh**".format(st.session_state["pp_annual_usage_kwh"]))
         st.write("- 공급방식: **{0}**".format(st.session_state["pp_supply_voltage_text"] or "-"))
-        st.write("- 검침일: **{0}일**".format(int(st.session_state.get("pp_meter_read_day", 0)) if st.session_state.get("pp_meter_read_day", 0) else "-"))
-        if st.session_state.get("pp_auto_avg_base_kw", 0.0) > 0:
-            st.write("- 자동 산출 기준 평균부하: **{0:,.1f} kW**".format(st.session_state["pp_auto_avg_base_kw"]))
-            st.write("- 자동 산출 경/중/최 평균부하: **{0:,.1f} / {1:,.1f} / {2:,.1f} kW**".format(
-                st.session_state.get("pp_auto_off_peak_kw", 0.0),
-                st.session_state.get("pp_auto_mid_peak_kw", 0.0),
-                st.session_state.get("pp_auto_peak_kw", 0.0),
-            ))
-            st.write("- 자동 산출 경/중/최 비율: **{0:.2f} / {1:.2f} / {2:.2f}**".format(
-                st.session_state.get("pp_auto_off_ratio", 0.0),
-                st.session_state.get("pp_auto_mid_ratio", 0.0),
-                st.session_state.get("pp_auto_peak_ratio", 0.0),
-            ))
 
-    st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
 st.subheader("그래프")
 g1, g2 = st.columns(2)
 
-
 with g1:
-    graph_df = hourly_df.copy()
-    use_pp_profile = (
-        st.session_state.get("pp_loaded", False)
-        and input_mode == "파워플래너 자동 산출"
-        and isinstance(st.session_state.get("pp_hourly_profile_kw", {}), dict)
-        and len(st.session_state.get("pp_hourly_profile_kw", {})) >= 6
-    )
-    if use_pp_profile:
-        pp_graph_rows = []
-        pp_profile = st.session_state.get("pp_hourly_profile_kw", {})
-        for h in range(24):
-            val = float(pp_profile.get(h, 0.0))
-            pp_graph_rows.append({
-                "시간번호": h,
-                "시간": f"{h:02d}:00",
-                "전력사용량(kW)": val,
-                "구분": hour_to_label(h, season),
-                "운영여부": "가동" if h in active_hours else "비가동",
-                "절감전력(kW)": 0.0,
-                "절감전력량(kWh)": 0.0,
-            })
-        graph_df = pd.DataFrame(pp_graph_rows)
-
     fig_load = px.line(
-        graph_df,
+        hourly_df,
         x="시간번호",
         y="전력사용량(kW)",
         markers=True,
-        hover_data=["시간", "구분", "운영여부"],
+        hover_data=["시간", "구분", "운영여부", "절감전력(kW)", "절감전력량(kWh)"],
         title="{0} 시간대별 전력사용량".format(season),
     )
     fig_load.update_xaxes(
         tickmode="array",
         tickvals=list(range(24)),
         ticktext=["{0:02d}".format(i) for i in range(24)],
+        title_text="시간",
     )
+    fig_load.update_yaxes(title_text="전력사용량(kW)")
     st.plotly_chart(fig_load, use_container_width=True)
 
 with g2:
-    tap_chart_df = tap_compare_df.copy()
-    if not tap_chart_df.empty:
-        tap_chart_df["탭"] = pd.to_numeric(tap_chart_df["탭"], errors="coerce")
-        tap_chart_df = tap_chart_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
-        fig_bar = go.Figure()
-        fig_bar.add_bar(
-            x=tap_chart_df["탭"].tolist(),
-            y=tap_chart_df["평균 절감전력(kW)"].tolist(),
-            text=[f"{v:.3f}" if float(v) != 0 else "0" for v in tap_chart_df["평균 절감전력(kW)"].tolist()],
-            textposition="outside",
-        )
-        fig_bar.update_layout(title="탭별 예상 절감전력 비교")
-        fig_bar.update_xaxes(
-            title_text="탭",
-            autorange="reversed",
-            tickmode="array",
-            tickvals=tap_chart_df["탭"].tolist(),
-            ticktext=[str(int(v)) for v in tap_chart_df["탭"].tolist()],
-        )
-        fig_bar.update_yaxes(title_text="평균 절감전력(kW)")
-        st.plotly_chart(fig_bar, use_container_width=True)
-    else:
-        st.info("표시할 탭별 비교 데이터가 없습니다.")
+    fig_bar = px.bar(
+        tap_compare_df,
+        x="탭",
+        y="평균 절감전력(kW)",
+        text="평균 절감전력(kW)",
+        title="탭별 예상 절감전력 비교",
+    )
+    fig_bar.update_xaxes(title_text="탭")
+    fig_bar.update_yaxes(title_text="평균 절감전력(kW)")
+    st.plotly_chart(fig_bar, use_container_width=True)
 
 st.divider()
 st.subheader("상세 데이터")
@@ -3110,11 +1788,7 @@ with st.expander("24시간 상세 결과", expanded=False):
     st.dataframe(hourly_df, use_container_width=True, hide_index=True)
 
 with st.expander("탭별 비교표", expanded=False):
-    tap_table_df = tap_compare_df.copy()
-    if not tap_table_df.empty:
-        tap_table_df["탭"] = pd.to_numeric(tap_table_df["탭"], errors="coerce")
-        tap_table_df = tap_table_df.sort_values(by="탭", ascending=False).reset_index(drop=True)
-    st.dataframe(tap_table_df, use_container_width=True, hide_index=True)
+    st.dataframe(tap_compare_df, use_container_width=True, hide_index=True)
 
 
 # =========================================================
@@ -3135,9 +1809,9 @@ pdf_error = None
 pdf_bytes = None
 
 try:
-    pdf_font_info = get_korean_font_info()
-    fig_line_buf = create_matplotlib_line_chart(hourly_df, season, font_info=pdf_font_info)
-    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, site_name, font_info=pdf_font_info)
+    matplotlib_font_family = get_matplotlib_font_family()
+    fig_line_buf = create_matplotlib_line_chart(hourly_df, season, font_family=matplotlib_font_family)
+    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, site_name, font_family=matplotlib_font_family)
 
     pdf_bytes = build_pdf_bytes_report(
         site_name=site_name,
@@ -3147,7 +1821,6 @@ try:
         primary_voltage_kv=primary_voltage_kv,
         secondary_voltage_v=secondary_voltage_v,
         new_voltage=new_voltage,
-        current_voltage_for_calc=current_voltage_for_calc,
         voltage_drop_pct=voltage_drop_pct,
         voltage_drop_v=voltage_drop_v,
         primary_voltage_class=primary_voltage_class,
