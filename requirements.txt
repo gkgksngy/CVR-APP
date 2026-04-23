@@ -3,6 +3,7 @@ selenium
 webdriver-manager
 pandas
 plotly
+kaleido
 reportlab
 matplotlib
 openpyxl
