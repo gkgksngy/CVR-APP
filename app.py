@@ -702,9 +702,6 @@ def _apply_font_to_axis(ax, font_prop):
 
 def create_matplotlib_line_chart(hourly_df, season, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
-        if font_info.get("mpl_name"):
-            plt.rcParams["font.family"] = font_info["mpl_name"]
-
         fig, ax = plt.subplots(figsize=(10, 4.8))
         ax.plot(hourly_df["시간번호"], hourly_df["전력사용량(kW)"], marker="o", linewidth=1.8)
         ax.set_xticks(list(range(24)))
@@ -713,23 +710,30 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
 
         font_prop = None
         if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            font_prop = fm.FontProperties(fname=font_info["font_path"])
-        elif font_info.get("mpl_name"):
-            font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            try:
+                font_prop = fm.FontProperties(fname=font_info["font_path"])
+            except Exception:
+                font_prop = None
 
-        # 그래프 내부 제목/축 라벨 복원
-        ax.set_title(f"{season} 시간대별 전력사용량")
-        ax.set_xlabel("시간")
-        ax.set_ylabel("전력사용량(kW)")
+        if font_prop is None and font_info.get("mpl_name"):
+            try:
+                font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            except Exception:
+                font_prop = None
 
         if font_prop is not None:
-            ax.title.set_fontproperties(font_prop)
-            ax.xaxis.label.set_fontproperties(font_prop)
-            ax.yaxis.label.set_fontproperties(font_prop)
+            ax.set_title(f"{season} 시간대별 전력사용량", fontproperties=font_prop, fontsize=12)
+            ax.set_xlabel("시간", fontproperties=font_prop)
+            ax.set_ylabel("전력사용량(kW)", fontproperties=font_prop)
+
             for label in ax.get_xticklabels():
                 label.set_fontproperties(font_prop)
             for label in ax.get_yticklabels():
                 label.set_fontproperties(font_prop)
+        else:
+            ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12)
+            ax.set_xlabel("시간")
+            ax.set_ylabel("전력사용량(kW)")
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -742,9 +746,6 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
 
 def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
-        if font_info.get("mpl_name"):
-            plt.rcParams["font.family"] = font_info["mpl_name"]
-
         plot_df = tap_compare_df.copy()
         plot_df["탭"] = pd.to_numeric(plot_df["탭"], errors="coerce")
         plot_df = plot_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
@@ -758,27 +759,52 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
 
         font_prop = None
         if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            font_prop = fm.FontProperties(fname=font_info["font_path"])
-        elif font_info.get("mpl_name"):
-            font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            try:
+                font_prop = fm.FontProperties(fname=font_info["font_path"])
+            except Exception:
+                font_prop = None
 
-        # 그래프 내부 제목/축 라벨 복원
-        ax.set_title(f"{site_name} 탭 변경별 예상 절감전력")
-        ax.set_xlabel("탭")
-        ax.set_ylabel("평균 절감전력(kW)")
+        if font_prop is None and font_info.get("mpl_name"):
+            try:
+                font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            except Exception:
+                font_prop = None
 
         if font_prop is not None:
-            ax.title.set_fontproperties(font_prop)
-            ax.xaxis.label.set_fontproperties(font_prop)
-            ax.yaxis.label.set_fontproperties(font_prop)
+            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontproperties=font_prop, fontsize=12)
+            ax.set_xlabel("탭", fontproperties=font_prop)
+            ax.set_ylabel("평균 절감전력(kW)", fontproperties=font_prop)
+
             for label in ax.get_xticklabels():
                 label.set_fontproperties(font_prop)
             for label in ax.get_yticklabels():
                 label.set_fontproperties(font_prop)
+        else:
+            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12)
+            ax.set_xlabel("탭")
+            ax.set_ylabel("평균 절감전력(kW)")
 
         for rect, val in zip(bars, y_vals):
             label = "0" if float(val) == 0 else f"{float(val):.3f}"
-            ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(), label, ha="center", va="bottom", fontsize=8)
+            if font_prop is not None:
+                ax.text(
+                    rect.get_x() + rect.get_width() / 2,
+                    rect.get_height(),
+                    label,
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    fontproperties=font_prop,
+                )
+            else:
+                ax.text(
+                    rect.get_x() + rect.get_width() / 2,
+                    rect.get_height(),
+                    label,
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
 
         buf = io.BytesIO()
         fig.tight_layout()
