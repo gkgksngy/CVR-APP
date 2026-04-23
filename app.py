@@ -38,6 +38,7 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
+from PIL import Image, ImageDraw, ImageFont
 
 
 st.set_page_config(page_title="CVR 운영형 계산기", layout="wide")
@@ -700,6 +701,71 @@ def _apply_font_to_axis(ax, font_prop):
             text.set_fontproperties(font_prop)
 
 
+def _get_pil_font(font_info, size):
+    candidates = []
+    if font_info.get("font_path"):
+        candidates.append(font_info["font_path"])
+    candidates.extend([
+        "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    ])
+    for path in candidates:
+        try:
+            if path and os.path.exists(path):
+                return ImageFont.truetype(path, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def annotate_chart_image(buf, title_text, x_label, y_label, font_info):
+    buf.seek(0)
+    img = Image.open(buf).convert("RGBA")
+    w, h = img.size
+
+    # extra canvas room around chart so labels sit where users expect
+    top_pad = 55
+    left_pad = 70
+    bottom_pad = 55
+    right_pad = 20
+
+    canvas = Image.new("RGBA", (w + left_pad + right_pad, h + top_pad + bottom_pad), "white")
+    canvas.paste(img, (left_pad, top_pad))
+
+    draw = ImageDraw.Draw(canvas)
+    title_font = _get_pil_font(font_info, 24)
+    axis_font = _get_pil_font(font_info, 22)
+
+    # title centered above plot
+    title_bbox = draw.textbbox((0, 0), title_text, font=title_font)
+    title_w = title_bbox[2] - title_bbox[0]
+    draw.text(((canvas.size[0] - title_w) / 2, 10), title_text, fill="black", font=title_font)
+
+    # x-axis label centered under plot
+    x_bbox = draw.textbbox((0, 0), x_label, font=axis_font)
+    x_w = x_bbox[2] - x_bbox[0]
+    x_x = left_pad + (w - x_w) / 2
+    x_y = top_pad + h + 12
+    draw.text((x_x, x_y), x_label, fill="black", font=axis_font)
+
+    # y-axis label rotated and centered beside y-axis
+    y_bbox = draw.textbbox((0, 0), y_label, font=axis_font)
+    y_w = y_bbox[2] - y_bbox[0]
+    y_h = y_bbox[3] - y_bbox[1]
+    y_img = Image.new("RGBA", (y_w + 10, y_h + 10), (255, 255, 255, 0))
+    y_draw = ImageDraw.Draw(y_img)
+    y_draw.text((5, 5), y_label, fill="black", font=axis_font)
+    y_rot = y_img.rotate(90, expand=True)
+    y_x = 12
+    y_y = top_pad + (h - y_rot.size[1]) // 2
+    canvas.alpha_composite(y_rot, (y_x, y_y))
+
+    out = io.BytesIO()
+    canvas.convert("RGB").save(out, format="PNG")
+    out.seek(0)
+    return out
+
 def create_matplotlib_line_chart(hourly_df, season, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
         fig, ax = plt.subplots(figsize=(10, 4.8))
@@ -716,7 +782,13 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
         fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
-        return buf
+        return annotate_chart_image(
+            buf,
+            title_text=f"{season} 시간대별 전력사용량",
+            x_label="시간",
+            y_label="전력사용량(kW)",
+            font_info=font_info,
+        )
 
 
 
@@ -752,7 +824,13 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
-        return buf
+        return annotate_chart_image(
+            buf,
+            title_text=f"{site_name} 탭 변경별 예상 절감전력",
+            x_label="탭",
+            y_label="평균 절감전력(kW)",
+            font_info=font_info,
+        )
 
 
 
@@ -2071,16 +2149,12 @@ def build_pdf_bytes_report(
 
     elements.append(Paragraph("5. 그래프", styles["KHeading"]))
     elements.append(Paragraph("5-1. 시간대별 전력사용량 그래프", styles["KBody"]))
-    elements.append(Spacer(1, 2))
-    elements.append(Paragraph("X축: 시간 / Y축: 전력사용량(kW)", styles["KBody"]))
     elements.append(Spacer(1, 4))
     elements.append(RLImage(fig_line_buf, width=180*mm, height=86*mm))
     elements.append(PageBreak())
 
     # 3페이지
     elements.append(Paragraph("5-2. 탭별 예상 절감전력 비교", styles["KBody"]))
-    elements.append(Spacer(1, 2))
-    elements.append(Paragraph("X축: 탭 / Y축: 평균 절감전력(kW)", styles["KBody"]))
     elements.append(Spacer(1, 4))
     elements.append(RLImage(fig_bar_buf, width=180*mm, height=86*mm))
     elements.append(Spacer(1, 10))
