@@ -700,13 +700,25 @@ def _apply_font_to_axis(ax, font_prop):
             text.set_fontproperties(font_prop)
 
 
-def create_matplotlib_line_chart(hourly_df, season, font_info):
+def create_matplotlib_line_chart(graph_df, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
+        if font_info.get("mpl_name"):
+            plt.rcParams["font.family"] = font_info["mpl_name"]
+
         fig, ax = plt.subplots(figsize=(10, 4.8))
-        ax.plot(hourly_df["시간번호"], hourly_df["전력사용량(kW)"], marker="o", linewidth=1.8)
+        ax.plot(
+            graph_df["시간번호"],
+            graph_df["전력사용량(kW)"],
+            marker="o",
+            linewidth=1.8,
+            color="#1f77b4",
+            markerfacecolor="#1f77b4",
+            markeredgecolor="#1f77b4",
+        )
         ax.set_xticks(list(range(24)))
         ax.set_xticklabels([f"{i:02d}" for i in range(24)], fontsize=8)
         ax.grid(True, alpha=0.3)
+        ax.set_title("")
 
         font_prop = None
         if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
@@ -714,24 +726,17 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
                 font_prop = fm.FontProperties(fname=font_info["font_path"])
             except Exception:
                 font_prop = None
-
-        if font_prop is None and font_info.get("mpl_name"):
+        elif font_info.get("mpl_name"):
             try:
                 font_prop = fm.FontProperties(family=font_info["mpl_name"])
             except Exception:
                 font_prop = None
 
         if font_prop is not None:
-            ax.set_title(f"{season} 시간대별 전력사용량", fontproperties=font_prop, fontsize=12)
             ax.set_xlabel("시간", fontproperties=font_prop)
             ax.set_ylabel("전력사용량(kW)", fontproperties=font_prop)
-
-            for label in ax.get_xticklabels():
-                label.set_fontproperties(font_prop)
-            for label in ax.get_yticklabels():
-                label.set_fontproperties(font_prop)
+            _apply_font_to_axis(ax, font_prop)
         else:
-            ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12)
             ax.set_xlabel("시간")
             ax.set_ylabel("전력사용량(kW)")
 
@@ -744,8 +749,11 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
 
 
 
-def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
+def create_matplotlib_bar_chart(tap_compare_df, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
+        if font_info.get("mpl_name"):
+            plt.rcParams["font.family"] = font_info["mpl_name"]
+
         plot_df = tap_compare_df.copy()
         plot_df["탭"] = pd.to_numeric(plot_df["탭"], errors="coerce")
         plot_df = plot_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
@@ -753,9 +761,10 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         fig, ax = plt.subplots(figsize=(10, 4.8))
         x_labels = plot_df["탭"].astype(int).astype(str)
         y_vals = plot_df["평균 절감전력(kW)"]
-        bars = ax.bar(x_labels, y_vals)
+        bars = ax.bar(x_labels, y_vals, color="#1f77b4", edgecolor="#1f77b4")
         ax.grid(True, axis="y", alpha=0.3)
         ax.invert_xaxis()
+        ax.set_title("")
 
         font_prop = None
         if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
@@ -763,48 +772,31 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
                 font_prop = fm.FontProperties(fname=font_info["font_path"])
             except Exception:
                 font_prop = None
-
-        if font_prop is None and font_info.get("mpl_name"):
+        elif font_info.get("mpl_name"):
             try:
                 font_prop = fm.FontProperties(family=font_info["mpl_name"])
             except Exception:
                 font_prop = None
 
         if font_prop is not None:
-            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontproperties=font_prop, fontsize=12)
             ax.set_xlabel("탭", fontproperties=font_prop)
             ax.set_ylabel("평균 절감전력(kW)", fontproperties=font_prop)
-
-            for label in ax.get_xticklabels():
-                label.set_fontproperties(font_prop)
-            for label in ax.get_yticklabels():
-                label.set_fontproperties(font_prop)
+            _apply_font_to_axis(ax, font_prop)
         else:
-            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12)
             ax.set_xlabel("탭")
             ax.set_ylabel("평균 절감전력(kW)")
 
         for rect, val in zip(bars, y_vals):
             label = "0" if float(val) == 0 else f"{float(val):.3f}"
-            if font_prop is not None:
-                ax.text(
-                    rect.get_x() + rect.get_width() / 2,
-                    rect.get_height(),
-                    label,
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    fontproperties=font_prop,
-                )
-            else:
-                ax.text(
-                    rect.get_x() + rect.get_width() / 2,
-                    rect.get_height(),
-                    label,
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height(),
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#333333",
+            )
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -3179,8 +3171,8 @@ pdf_bytes = None
 
 try:
     pdf_font_info = get_korean_font_info()
-    fig_line_buf = create_matplotlib_line_chart(hourly_df, season, font_info=pdf_font_info)
-    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, site_name, font_info=pdf_font_info)
+    fig_line_buf = create_matplotlib_line_chart(graph_df, font_info=pdf_font_info)
+    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, font_info=pdf_font_info)
 
     pdf_bytes = build_pdf_bytes_report(
         site_name=site_name,
