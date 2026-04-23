@@ -721,17 +721,16 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
             except Exception:
                 font_prop = None
 
+        # 제목은 PDF 본문 문단(5-1)에서 이미 표시하므로 차트 내부 제목은 제거
+        ax.set_title("")
         if font_prop is not None:
-            ax.set_title(f"{season} 시간대별 전력사용량", fontproperties=font_prop, fontsize=12)
             ax.set_xlabel("시간", fontproperties=font_prop)
             ax.set_ylabel("전력사용량(kW)", fontproperties=font_prop)
-
             for label in ax.get_xticklabels():
                 label.set_fontproperties(font_prop)
             for label in ax.get_yticklabels():
                 label.set_fontproperties(font_prop)
         else:
-            ax.set_title(f"{season} 시간대별 전력사용량", fontsize=12)
             ax.set_xlabel("시간")
             ax.set_ylabel("전력사용량(kW)")
 
@@ -770,17 +769,16 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
             except Exception:
                 font_prop = None
 
+        # 제목은 PDF 본문 문단(5-2)에서 이미 표시하므로 차트 내부 제목은 제거
+        ax.set_title("")
         if font_prop is not None:
-            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontproperties=font_prop, fontsize=12)
             ax.set_xlabel("탭", fontproperties=font_prop)
             ax.set_ylabel("평균 절감전력(kW)", fontproperties=font_prop)
-
             for label in ax.get_xticklabels():
                 label.set_fontproperties(font_prop)
             for label in ax.get_yticklabels():
                 label.set_fontproperties(font_prop)
         else:
-            ax.set_title(f"{site_name} 탭 변경별 예상 절감전력", fontsize=12)
             ax.set_xlabel("탭")
             ax.set_ylabel("평균 절감전력(kW)")
 
