@@ -704,6 +704,7 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
         if font_info.get("mpl_name"):
             plt.rcParams["font.family"] = font_info["mpl_name"]
+
         fig, ax = plt.subplots(figsize=(10, 4.8))
         ax.plot(hourly_df["시간번호"], hourly_df["전력사용량(kW)"], marker="o", linewidth=1.8)
         ax.set_xticks(list(range(24)))
@@ -716,13 +717,19 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
-        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
-        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
-        ax.set_title("")
-        ax.set_xlabel("")
-        ax.set_ylabel("")
+        # 그래프 내부 제목/축 라벨 복원
+        ax.set_title(f"{season} 시간대별 전력사용량")
+        ax.set_xlabel("시간")
+        ax.set_ylabel("전력사용량(kW)")
+
         if font_prop is not None:
-            _apply_font_to_axis(ax, font_prop)
+            ax.title.set_fontproperties(font_prop)
+            ax.xaxis.label.set_fontproperties(font_prop)
+            ax.yaxis.label.set_fontproperties(font_prop)
+            for label in ax.get_xticklabels():
+                label.set_fontproperties(font_prop)
+            for label in ax.get_yticklabels():
+                label.set_fontproperties(font_prop)
 
         buf = io.BytesIO()
         fig.tight_layout()
@@ -732,13 +739,16 @@ def create_matplotlib_line_chart(hourly_df, season, font_info):
         return buf
 
 
+
 def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
         if font_info.get("mpl_name"):
             plt.rcParams["font.family"] = font_info["mpl_name"]
+
         plot_df = tap_compare_df.copy()
         plot_df["탭"] = pd.to_numeric(plot_df["탭"], errors="coerce")
         plot_df = plot_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
+
         fig, ax = plt.subplots(figsize=(10, 4.8))
         x_labels = plot_df["탭"].astype(int).astype(str)
         y_vals = plot_df["평균 절감전력(kW)"]
@@ -752,13 +762,19 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         elif font_info.get("mpl_name"):
             font_prop = fm.FontProperties(family=font_info["mpl_name"])
 
-        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
-        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
-        ax.set_title("")
-        ax.set_xlabel("")
-        ax.set_ylabel("")
+        # 그래프 내부 제목/축 라벨 복원
+        ax.set_title(f"{site_name} 탭 변경별 예상 절감전력")
+        ax.set_xlabel("탭")
+        ax.set_ylabel("평균 절감전력(kW)")
+
         if font_prop is not None:
-            _apply_font_to_axis(ax, font_prop)
+            ax.title.set_fontproperties(font_prop)
+            ax.xaxis.label.set_fontproperties(font_prop)
+            ax.yaxis.label.set_fontproperties(font_prop)
+            for label in ax.get_xticklabels():
+                label.set_fontproperties(font_prop)
+            for label in ax.get_yticklabels():
+                label.set_fontproperties(font_prop)
 
         for rect, val in zip(bars, y_vals):
             label = "0" if float(val) == 0 else f"{float(val):.3f}"
@@ -770,6 +786,7 @@ def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
         plt.close(fig)
         buf.seek(0)
         return buf
+
 
 
 def split_even_rows(data):
