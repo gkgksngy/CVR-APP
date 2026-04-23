@@ -34,7 +34,6 @@ from reportlab.platypus import (
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.graphics.shapes import Drawing, String
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 import matplotlib.pyplot as plt
@@ -701,124 +700,119 @@ def _apply_font_to_axis(ax, font_prop):
             text.set_fontproperties(font_prop)
 
 
-def create_matplotlib_line_chart(hourly_df, season, font_info):
+def create_matplotlib_line_chart(graph_df, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
         if font_info.get("mpl_name"):
             plt.rcParams["font.family"] = font_info["mpl_name"]
+
         fig, ax = plt.subplots(figsize=(10, 4.8))
-        ax.plot(hourly_df["시간번호"], hourly_df["전력사용량(kW)"], marker="o", linewidth=1.8)
+        ax.plot(
+            graph_df["시간번호"],
+            graph_df["전력사용량(kW)"],
+            marker="o",
+            linewidth=1.8,
+            color="#1f77b4",
+            markerfacecolor="#1f77b4",
+            markeredgecolor="#1f77b4",
+        )
         ax.set_xticks(list(range(24)))
         ax.set_xticklabels([f"{i:02d}" for i in range(24)], fontsize=8)
         ax.grid(True, alpha=0.3)
 
         font_prop = None
         if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            font_prop = fm.FontProperties(fname=font_info["font_path"])
+            try:
+                font_prop = fm.FontProperties(fname=font_info["font_path"])
+            except Exception:
+                font_prop = None
         elif font_info.get("mpl_name"):
-            font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            try:
+                font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            except Exception:
+                font_prop = None
 
-        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
-        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
         ax.set_title("")
-        ax.set_xlabel("")
-        ax.set_ylabel("")
         if font_prop is not None:
+            ax.set_xlabel("시간", fontproperties=font_prop, fontsize=9, labelpad=8)
+            ax.set_ylabel("전력사용량(kW)", fontproperties=font_prop, fontsize=8, labelpad=18, rotation=90)
             _apply_font_to_axis(ax, font_prop)
+        else:
+            ax.set_xlabel("시간", fontsize=9, labelpad=8)
+            ax.set_ylabel("전력사용량(kW)", fontsize=8, labelpad=18, rotation=90)
+
+        fig.subplots_adjust(left=0.16, bottom=0.16)
 
         buf = io.BytesIO()
-        fig.tight_layout()
         fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
         return buf
 
 
-def create_matplotlib_bar_chart(tap_compare_df, site_name, font_info):
+
+def create_matplotlib_bar_chart(tap_compare_df, font_info):
     with plt.rc_context({"axes.unicode_minus": False}):
         if font_info.get("mpl_name"):
             plt.rcParams["font.family"] = font_info["mpl_name"]
+
         plot_df = tap_compare_df.copy()
         plot_df["탭"] = pd.to_numeric(plot_df["탭"], errors="coerce")
         plot_df = plot_df.sort_values(by="탭", ascending=True).reset_index(drop=True)
+
         fig, ax = plt.subplots(figsize=(10, 4.8))
         x_labels = plot_df["탭"].astype(int).astype(str)
         y_vals = plot_df["평균 절감전력(kW)"]
-        bars = ax.bar(x_labels, y_vals)
+        bars = ax.bar(
+            x_labels,
+            y_vals,
+            color="#1f77b4",
+            edgecolor="#1f77b4",
+        )
         ax.grid(True, axis="y", alpha=0.3)
         ax.invert_xaxis()
 
         font_prop = None
         if font_info.get("font_path") and os.path.exists(font_info["font_path"]):
-            font_prop = fm.FontProperties(fname=font_info["font_path"])
+            try:
+                font_prop = fm.FontProperties(fname=font_info["font_path"])
+            except Exception:
+                font_prop = None
         elif font_info.get("mpl_name"):
-            font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            try:
+                font_prop = fm.FontProperties(family=font_info["mpl_name"])
+            except Exception:
+                font_prop = None
 
-        # PDF에서는 matplotlib 한글이 환경에 따라 깨질 수 있어서
-        # 그래프 내부 제목/축 라벨은 제거하고, 한국어 제목은 PDF 본문 Paragraph로 표시한다.
         ax.set_title("")
-        ax.set_xlabel("")
-        ax.set_ylabel("")
         if font_prop is not None:
+            ax.set_xlabel("탭", fontproperties=font_prop, fontsize=9, labelpad=8)
+            ax.set_ylabel("평균 절감전력(kW)", fontproperties=font_prop, fontsize=8, labelpad=18, rotation=90)
             _apply_font_to_axis(ax, font_prop)
+        else:
+            ax.set_xlabel("탭", fontsize=9, labelpad=8)
+            ax.set_ylabel("평균 절감전력(kW)", fontsize=8, labelpad=18, rotation=90)
 
         for rect, val in zip(bars, y_vals):
             label = "0" if float(val) == 0 else f"{float(val):.3f}"
-            ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height(), label, ha="center", va="bottom", fontsize=8)
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height(),
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#333333",
+            )
+
+        fig.subplots_adjust(left=0.16, bottom=0.16)
 
         buf = io.BytesIO()
-        fig.tight_layout()
         fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
         return buf
 
 
-def make_pdf_graph_block(image_buf, title_text, x_label_text, y_label_text, font_name, body_style):
-    # 세로축 라벨은 reportlab Drawing으로 회전해서 표시
-    y_drawing = Drawing(18 * mm, 86 * mm)
-    y_drawing.add(
-        String(
-            8 * mm,
-            43 * mm,
-            y_label_text,
-            fontName=font_name,
-            fontSize=9,
-            fillColor=colors.black,
-            textAnchor="middle",
-            angle=90,
-        )
-    )
-
-    graph_table = Table(
-        [[y_drawing, RLImage(image_buf, width=180 * mm, height=86 * mm)]],
-        colWidths=[18 * mm, 180 * mm],
-    )
-    graph_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-    ]))
-
-    x_style = ParagraphStyle(
-        "GraphXAxisStyle",
-        parent=body_style,
-        alignment=TA_CENTER,
-        fontName=font_name,
-        fontSize=9,
-        leading=11,
-        spaceBefore=3,
-        spaceAfter=0,
-    )
-
-    return [
-        Paragraph(title_text, body_style),
-        Spacer(1, 4),
-        graph_table,
-        Paragraph(x_label_text, x_style),
-    ]
 
 def split_even_rows(data):
     if len(data) <= 1:
@@ -2134,29 +2128,15 @@ def build_pdf_bytes_report(
     elements.append(Spacer(1, 8))
 
     elements.append(Paragraph("5. 그래프", styles["KHeading"]))
-    elements.extend(
-        make_pdf_graph_block(
-            image_buf=fig_line_buf,
-            title_text="5-1. 시간대별 전력사용량 그래프",
-            x_label_text="시간",
-            y_label_text="전력사용량(kW)",
-            font_name=font_name,
-            body_style=styles["KBody"],
-        )
-    )
+    elements.append(Paragraph("5-1. 시간대별 전력사용량 그래프", styles["KBody"]))
+    elements.append(Spacer(1, 4))
+    elements.append(RLImage(fig_line_buf, width=180*mm, height=86*mm))
     elements.append(PageBreak())
 
     # 3페이지
-    elements.extend(
-        make_pdf_graph_block(
-            image_buf=fig_bar_buf,
-            title_text="5-2. 탭별 예상 절감전력 비교",
-            x_label_text="탭",
-            y_label_text="평균 절감전력(kW)",
-            font_name=font_name,
-            body_style=styles["KBody"],
-        )
-    )
+    elements.append(Paragraph("5-2. 탭별 예상 절감전력 비교", styles["KBody"]))
+    elements.append(Spacer(1, 4))
+    elements.append(RLImage(fig_bar_buf, width=180*mm, height=86*mm))
     elements.append(Spacer(1, 10))
 
     elements.append(Paragraph("6. 계산 결과 요약표", styles["KHeading"]))
@@ -3198,8 +3178,8 @@ pdf_bytes = None
 
 try:
     pdf_font_info = get_korean_font_info()
-    fig_line_buf = create_matplotlib_line_chart(hourly_df, season, font_info=pdf_font_info)
-    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, site_name, font_info=pdf_font_info)
+    fig_line_buf = create_matplotlib_line_chart(graph_df, font_info=pdf_font_info)
+    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, font_info=pdf_font_info)
 
     pdf_bytes = build_pdf_bytes_report(
         site_name=site_name,
