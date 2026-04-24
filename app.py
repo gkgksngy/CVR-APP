@@ -98,9 +98,10 @@ LOAD_TYPES = {
 
 SEASON_SCHEDULE = {
     "봄·가을": {
-        "경부하": list(range(23, 24)) + list(range(0, 9)),
-        "중간부하": [9, 10, 11, 13, 14, 15, 16, 20, 21, 22],
-        "최대부하": [12, 17, 18, 19],
+        # 파워플래너 시간대별 구분표 기준
+        "경부하": list(range(23, 24)) + list(range(0, 8)),
+        "중간부하": list(range(8, 11)) + list(range(13, 18)) + [22],
+        "최대부하": list(range(11, 13)) + list(range(18, 22)),
     },
     "여름": {
         "경부하": list(range(23, 24)) + list(range(0, 9)),
@@ -1058,39 +1059,47 @@ def _summarize_by_actual_load_level(hourly_profile_kw):
 
 def summarize_band_loads_from_hourly(hourly_map, season):
     """
-    파워플래너의 계절별 시간대 구분표 그대로 경/중/최대부하를 산출한다.
-    여기서는 실제 부하 크기 순위로 재분류하지 않는다.
-    즉, 파워플래너와 비교 가능한 값이 되도록 시간대 기준을 유지한다.
+    파워플래너 시간대별 사용량 값을 그대로 사용하되,
+    경/중/최대부하는 파워플래너 계절별 시간대 구분표 기준으로만 나눈다.
+    조회 당일 자료처럼 미래 시간이 0으로 채워진 경우가 많아서 계산용 평균부하/비율은 양수 데이터 기준으로 산출한다.
+    그래프 표시용 hourly_profile_kw는 원본 24시간 형태를 유지한다.
     """
     hourly_profile_kw = aggregate_hourly_profile_kw(hourly_map)
     if not hourly_profile_kw:
         return None
 
-    positive_values = [v for v in hourly_profile_kw.values() if v > 0]
-    if not positive_values:
+    target_season = season if season in SEASON_SCHEDULE else month_to_season(datetime.now().month)
+    valid_items = {}
+    for h in range(24):
+        try:
+            kw = float(hourly_profile_kw.get(h, 0.0))
+        except Exception:
+            kw = 0.0
+        if kw > 0:
+            valid_items[h] = kw
+
+    if not valid_items:
         return None
 
-    # 24시간 자료가 있으면 0값도 포함하여 하루 평균부하를 계산한다.
-    # 파워플래너 시간대별 자료에서 12~24시가 0이면 그 0도 실제 자료로 취급한다.
-    denominator_hours = 24 if len(hourly_profile_kw) >= 12 else len(hourly_profile_kw)
-    base_avg_kw = sum(float(hourly_profile_kw.get(h, 0.0)) for h in range(24)) / denominator_hours
-    if base_avg_kw <= 0:
-        base_avg_kw = sum(positive_values) / len(positive_values)
+    base_avg_kw = sum(valid_items.values()) / len(valid_items)
     if base_avg_kw <= 0:
         return None
 
     band_buckets = {"경부하": [], "중간부하": [], "최대부하": []}
-    target_season = season if season in SEASON_SCHEDULE else month_to_season(datetime.now().month)
+    band_energy = {"경부하": 0.0, "중간부하": 0.0, "최대부하": 0.0}
 
-    for hour in range(24):
-        kw = float(hourly_profile_kw.get(hour, 0.0))
+    for hour, kw in sorted(valid_items.items()):
         band = hour_to_label(hour, target_season)
         band_buckets[band].append(kw)
+        band_energy[band] += kw
 
     band_avg = {}
     for label in ["경부하", "중간부하", "최대부하"]:
         vals = band_buckets[label]
         band_avg[label] = (sum(vals) / len(vals)) if vals else 0.0
+
+    total_energy = sum(band_energy.values())
+    energy_ratio = {k: (band_energy[k] / total_energy if total_energy else 0.0) for k in band_energy}
 
     return {
         "base_avg_kw": round(base_avg_kw, 3),
@@ -1100,10 +1109,13 @@ def summarize_band_loads_from_hourly(hourly_map, season):
         "off_ratio": round(band_avg["경부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
         "mid_ratio": round(band_avg["중간부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
         "peak_ratio": round(band_avg["최대부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
+        "energy_off_ratio": round(energy_ratio["경부하"], 4),
+        "energy_mid_ratio": round(energy_ratio["중간부하"], 4),
+        "energy_peak_ratio": round(energy_ratio["최대부하"], 4),
         "hourly_profile_kw": hourly_profile_kw,
-        "source": "powerplanner_tou_hourly",
+        "valid_hour_count": len(valid_items),
+        "source": "powerplanner_tou_hourly_positive",
     }
-
 
 def select_15min_view_if_available(driver, by, logs, label):
     try:
@@ -1730,23 +1742,27 @@ def scrape_daily_usage_page(page, result, logs):
     # 이 값은 파워플래너 요금계산에 직접 쓰이는 시간대 구분값이므로, CVR 계산에서도 가장 신뢰도가 높다.
     daily_band_summary = extract_daily_timeband_energy_summary(tables, season=month_to_season(datetime.now().month))
     if daily_band_summary:
-        result["auto_avg_base_kw"] = daily_band_summary["base_avg_kw"]
-        result["auto_off_peak_kw"] = daily_band_summary["off_peak_kw"]
-        result["auto_mid_peak_kw"] = daily_band_summary["mid_peak_kw"]
-        result["auto_peak_kw"] = daily_band_summary["peak_kw"]
-        result["auto_off_ratio"] = daily_band_summary["off_ratio"]
-        result["auto_mid_ratio"] = daily_band_summary["mid_ratio"]
-        result["auto_peak_ratio"] = daily_band_summary["peak_ratio"]
-        result["auto_source"] = "daily_bill_timeband"
-        add_log(
-            logs,
-            "일별요금 경/중/최대부하 kWh 기준 자동 산출 반영: "
-            f"평균 {daily_band_summary['base_avg_kw']:,.1f} kW / "
-            f"경 {daily_band_summary['off_peak_kw']:,.1f} / "
-            f"중 {daily_band_summary['mid_peak_kw']:,.1f} / "
-            f"최대 {daily_band_summary['peak_kw']:,.1f} kW "
-            f"({daily_band_summary['valid_days']}일 기준)"
-        )
+        if result.get("auto_avg_base_kw", 0.0) <= 0:
+            result["auto_avg_base_kw"] = daily_band_summary["base_avg_kw"]
+            result["auto_off_peak_kw"] = daily_band_summary["off_peak_kw"]
+            result["auto_mid_peak_kw"] = daily_band_summary["mid_peak_kw"]
+            result["auto_peak_kw"] = daily_band_summary["peak_kw"]
+            result["auto_off_ratio"] = daily_band_summary["off_ratio"]
+            result["auto_mid_ratio"] = daily_band_summary["mid_ratio"]
+            result["auto_peak_ratio"] = daily_band_summary["peak_ratio"]
+            result["auto_source"] = "daily_bill_timeband"
+            add_log(logs, "시간대별 사용량 값이 없어 일별요금 경/중/최대 값을 기준으로 평균부하를 반영했습니다.")
+        else:
+            add_log(
+                logs,
+                f"일별요금 경/중/최대 값은 보조 확인용으로만 사용: "
+                f"평균 {daily_band_summary['base_avg_kw']:,.1f} kW / "
+                f"경 {daily_band_summary['off_peak_kw']:,.1f} / "
+                f"중 {daily_band_summary['mid_peak_kw']:,.1f} / "
+                f"최대 {daily_band_summary['peak_kw']:,.1f} kW "
+                f"({daily_band_summary['valid_days']}일 기준)"
+            )
+
 
     md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
