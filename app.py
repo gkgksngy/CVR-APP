@@ -79,6 +79,9 @@ DEFAULT_STATE = {
     "pp_auto_mid_ratio": 0.0,
     "pp_auto_peak_ratio": 0.0,
     "pp_hourly_profile_kw": {},
+    "pp_daily_band_kwh": {},
+    "pp_monthly_band_kwh": {},
+    "pp_auto_source": "",
 }
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
@@ -1742,26 +1745,28 @@ def scrape_daily_usage_page(page, result, logs):
     # 이 값은 파워플래너 요금계산에 직접 쓰이는 시간대 구분값이므로, CVR 계산에서도 가장 신뢰도가 높다.
     daily_band_summary = extract_daily_timeband_energy_summary(tables, season=month_to_season(datetime.now().month))
     if daily_band_summary:
-        if result.get("auto_avg_base_kw", 0.0) <= 0:
-            result["auto_avg_base_kw"] = daily_band_summary["base_avg_kw"]
-            result["auto_off_peak_kw"] = daily_band_summary["off_peak_kw"]
-            result["auto_mid_peak_kw"] = daily_band_summary["mid_peak_kw"]
-            result["auto_peak_kw"] = daily_band_summary["peak_kw"]
-            result["auto_off_ratio"] = daily_band_summary["off_ratio"]
-            result["auto_mid_ratio"] = daily_band_summary["mid_ratio"]
-            result["auto_peak_ratio"] = daily_band_summary["peak_ratio"]
-            result["auto_source"] = "daily_bill_timeband"
-            add_log(logs, "시간대별 사용량 값이 없어 일별요금 경/중/최대 값을 기준으로 평균부하를 반영했습니다.")
-        else:
-            add_log(
-                logs,
-                f"일별요금 경/중/최대 값은 보조 확인용으로만 사용: "
-                f"평균 {daily_band_summary['base_avg_kw']:,.1f} kW / "
-                f"경 {daily_band_summary['off_peak_kw']:,.1f} / "
-                f"중 {daily_band_summary['mid_peak_kw']:,.1f} / "
-                f"최대 {daily_band_summary['peak_kw']:,.1f} kW "
-                f"({daily_band_summary['valid_days']}일 기준)"
-            )
+        # 정확도 우선: 파워플래너 요금표에 실제로 쓰이는 일별요금 경/중/최대 kWh를 항상 최우선 반영한다.
+        # 시간대별 그래프는 화면 표시용 보조자료로만 두고, CVR 계산 기준은 이 값으로 고정한다.
+        result["auto_avg_base_kw"] = daily_band_summary["base_avg_kw"]
+        result["auto_off_peak_kw"] = daily_band_summary["off_peak_kw"]
+        result["auto_mid_peak_kw"] = daily_band_summary["mid_peak_kw"]
+        result["auto_peak_kw"] = daily_band_summary["peak_kw"]
+        result["auto_off_ratio"] = daily_band_summary["off_ratio"]
+        result["auto_mid_ratio"] = daily_band_summary["mid_ratio"]
+        result["auto_peak_ratio"] = daily_band_summary["peak_ratio"]
+        result["daily_band_kwh"] = daily_band_summary.get("daily_band_kwh", {})
+        result["monthly_band_kwh"] = daily_band_summary.get("monthly_band_kwh", {})
+        result["auto_source"] = "daily_bill_timeband"
+        result["hourly_profile_kw"] = {}
+        add_log(
+            logs,
+            f"정확도 우선 적용: 일별요금 경/중/최대 kWh 기준으로 평균부하를 최종 반영: "
+            f"평균 {daily_band_summary['base_avg_kw']:,.1f} kW / "
+            f"경 {daily_band_summary['off_peak_kw']:,.1f} / "
+            f"중 {daily_band_summary['mid_peak_kw']:,.1f} / "
+            f"최대 {daily_band_summary['peak_kw']:,.1f} kW "
+            f"({daily_band_summary['valid_days']}일 기준)"
+        )
 
 
     md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
@@ -1975,6 +1980,8 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "auto_mid_ratio": 0.0,
             "auto_peak_ratio": 0.0,
             "hourly_profile_kw": {},
+            "daily_band_kwh": {},
+            "monthly_band_kwh": {},
             "auto_source": "",
         }
 
@@ -2726,6 +2733,9 @@ with left:
                             st.session_state["pp_auto_mid_ratio"] = result.get("auto_mid_ratio", 0.0)
                             st.session_state["pp_auto_peak_ratio"] = result.get("auto_peak_ratio", 0.0)
                             st.session_state["pp_hourly_profile_kw"] = result.get("hourly_profile_kw", {})
+                            st.session_state["pp_daily_band_kwh"] = result.get("daily_band_kwh", {})
+                            st.session_state["pp_monthly_band_kwh"] = result.get("monthly_band_kwh", {})
+                            st.session_state["pp_auto_source"] = result.get("auto_source", "")
                             st.success(result["message"])
                         else:
                             st.error(result["message"])
@@ -2970,7 +2980,7 @@ with left:
         ratio_color = "auto" if auto_ratio_ready else "verify"
 
         if auto_ratio_ready:
-            st.caption("파워플래너 시간대 평균부하를 기준으로 자동 산출되며, 필요 시 직접 수정할 수 있습니다.")
+            st.caption("파워플래너 일별요금 경/중/최대 kWh를 우선 기준으로 자동 산출되며, 필요 시 직접 수정할 수 있습니다.")
             default_avg_kw = st.session_state.get("pp_auto_avg_base_kw", 0.0)
             default_off_ratio = st.session_state.get("pp_auto_off_ratio", 1.0)
             default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.0)
@@ -2995,7 +3005,7 @@ with left:
         r1, r2, r3 = st.columns(3)
         with r1:
             off_ratio = colored_input(
-                "경부하 비율",
+                "경부하 부하계수",
                 st.number_input,
                 ratio_color,
                 min_value=0.0,
@@ -3005,7 +3015,7 @@ with left:
             )
         with r2:
             mid_ratio = colored_input(
-                "중간부하 비율",
+                "중간부하 부하계수",
                 st.number_input,
                 ratio_color,
                 min_value=0.0,
@@ -3015,7 +3025,7 @@ with left:
             )
         with r3:
             peak_ratio = colored_input(
-                "최대부하 비율",
+                "최대부하 부하계수",
                 st.number_input,
                 ratio_color,
                 min_value=0.0,
@@ -3101,6 +3111,7 @@ pp_profile_raw = st.session_state.get("pp_hourly_profile_kw", {})
 use_pp_hourly_engine = (
     st.session_state.get("pp_loaded", False)
     and input_mode == "파워플래너 자동 산출"
+    and st.session_state.get("pp_auto_source", "") != "daily_bill_timeband"
     and isinstance(pp_profile_raw, dict)
     and len(pp_profile_raw) >= 6
 )
@@ -3418,11 +3429,21 @@ with right:
                 st.session_state.get("pp_auto_mid_peak_kw", 0.0),
                 st.session_state.get("pp_auto_peak_kw", 0.0),
             ))
-            st.write("- 자동 산출 경/중/최 비율: **{0:.2f} / {1:.2f} / {2:.2f}**".format(
+            st.write("- 자동 산출 경/중/최 부하계수: **{0:.2f} / {1:.2f} / {2:.2f}**".format(
                 st.session_state.get("pp_auto_off_ratio", 0.0),
                 st.session_state.get("pp_auto_mid_ratio", 0.0),
                 st.session_state.get("pp_auto_peak_ratio", 0.0),
             ))
+            if st.session_state.get("pp_auto_source", "") == "daily_bill_timeband":
+                st.write("- 계산 기준: **파워플래너 일별요금 경/중/최대 kWh 우선**")
+                monthly_band = st.session_state.get("pp_monthly_band_kwh", {}) or {}
+                total_band = sum(float(v) for v in monthly_band.values()) if isinstance(monthly_band, dict) else 0.0
+                if total_band > 0:
+                    st.write("- 월 경/중/최 kWh 비중: **{0:.2f}% / {1:.2f}% / {2:.2f}%**".format(
+                        float(monthly_band.get("경부하", 0.0)) / total_band * 100.0,
+                        float(monthly_band.get("중간부하", 0.0)) / total_band * 100.0,
+                        float(monthly_band.get("최대부하", 0.0)) / total_band * 100.0,
+                    ))
 
     st.markdown("</div>", unsafe_allow_html=True)
 
