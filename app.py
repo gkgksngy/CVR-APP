@@ -1002,10 +1002,65 @@ def aggregate_hourly_profile_kw(hourly_map):
     return {h: round(sum(vals) / len(vals), 3) for h, vals in sorted(buckets.items()) if vals}
 
 
+def _summarize_by_actual_load_level(hourly_profile_kw):
+    """
+    시간표가 아니라 실제 24시간 부하 크기 기준으로 경/중/최대부하 평균을 나눈다.
+    최대부하 시간대가 0.00으로 무너지는 경우를 방지하기 위한 보정 로직이다.
+    """
+    values = [float(v) for v in hourly_profile_kw.values() if float(v) > 0]
+    if not values:
+        return None
+
+    base_avg_kw = sum(values) / len(values)
+    max_kw = max(values)
+    if base_avg_kw <= 0 or max_kw <= 0:
+        return None
+
+    peak_vals = [v for v in values if v >= max_kw * 0.85]
+    mid_vals = [v for v in values if max_kw * 0.45 <= v < max_kw * 0.85]
+    off_vals = [v for v in values if v < max_kw * 0.45]
+
+    if not peak_vals or not mid_vals or not off_vals:
+        ordered = sorted(values)
+        n = len(ordered)
+        if n >= 3:
+            low_end = max(1, int(round(n * 0.33)))
+            high_start = min(n - 1, int(round(n * 0.67)))
+            off_vals = ordered[:low_end]
+            mid_vals = ordered[low_end:high_start]
+            peak_vals = ordered[high_start:]
+        else:
+            off_vals = ordered[:1]
+            mid_vals = ordered
+            peak_vals = ordered[-1:]
+
+    def avg(vals, fallback):
+        return sum(vals) / len(vals) if vals else fallback
+
+    band_avg = {
+        "경부하": avg(off_vals, base_avg_kw),
+        "중간부하": avg(mid_vals, base_avg_kw),
+        "최대부하": avg(peak_vals, max_kw),
+    }
+
+    return {
+        "base_avg_kw": round(base_avg_kw, 3),
+        "off_peak_kw": round(band_avg["경부하"], 3),
+        "mid_peak_kw": round(band_avg["중간부하"], 3),
+        "peak_kw": round(band_avg["최대부하"], 3),
+        "off_ratio": round(band_avg["경부하"] / base_avg_kw, 4),
+        "mid_ratio": round(band_avg["중간부하"] / base_avg_kw, 4),
+        "peak_ratio": round(band_avg["최대부하"] / base_avg_kw, 4),
+        "hourly_profile_kw": hourly_profile_kw,
+        "source": "actual_load_level",
+    }
+
+
 def summarize_band_loads_from_hourly(hourly_map, season):
     """
-    실제 시간대별 사용량을 우선 기준으로 경/중/최 평균부하와 비율을 계산한다.
-    가중치 고정값은 사용하지 않는다.
+    파워플래너 시간대별 사용량을 기준으로 평균부하와 경/중/최 비율을 계산한다.
+    기본은 한전 계절별 시간대 구분표 기준.
+    단, 최대부하 시간대 값이 거의 0인데 실제 그래프에는 피크가 있으면 실제 부하 크기 기준으로 보정한다.
     """
     hourly_profile_kw = aggregate_hourly_profile_kw(hourly_map)
     if not hourly_profile_kw:
@@ -1019,17 +1074,27 @@ def summarize_band_loads_from_hourly(hourly_map, season):
     if base_avg_kw <= 0:
         return None
 
-    schedule = SEASON_SCHEDULE.get(season) or SEASON_SCHEDULE["봄·가을"]
     band_buckets = {"경부하": [], "중간부하": [], "최대부하": []}
-
     for hour, kw in hourly_profile_kw.items():
         band = hour_to_label(hour, season if season in SEASON_SCHEDULE else "봄·가을")
         band_buckets[band].append(kw)
 
     band_avg = {}
     for label in ["경부하", "중간부하", "최대부하"]:
-        vals = band_buckets[label]
-        band_avg[label] = (sum(vals) / len(vals)) if vals else base_avg_kw
+        vals = [v for v in band_buckets[label] if v > 0]
+        band_avg[label] = (sum(vals) / len(vals)) if vals else 0.0
+
+    max_kw = max(positive_values)
+    peak_ratio_raw = band_avg["최대부하"] / base_avg_kw if base_avg_kw else 0.0
+
+    if peak_ratio_raw < 0.10 and max_kw >= base_avg_kw * 1.20:
+        by_level = _summarize_by_actual_load_level(hourly_profile_kw)
+        if by_level:
+            return by_level
+
+    for label in ["경부하", "중간부하", "최대부하"]:
+        if band_avg[label] <= 0:
+            band_avg[label] = base_avg_kw
 
     off_ratio = band_avg["경부하"] / base_avg_kw if base_avg_kw else 1.0
     mid_ratio = band_avg["중간부하"] / base_avg_kw if base_avg_kw else 1.0
@@ -1044,7 +1109,7 @@ def summarize_band_loads_from_hourly(hourly_map, season):
         "mid_ratio": round(mid_ratio, 4),
         "peak_ratio": round(peak_ratio, 4),
         "hourly_profile_kw": hourly_profile_kw,
-        "source": "actual_hourly_usage",
+        "source": "tou_timeband" if peak_ratio_raw >= 0.10 else "tou_timeband_fallback",
     }
 
 def select_15min_view_if_available(driver, by, logs, label):
@@ -2783,6 +2848,7 @@ with left:
                 min_value=0.0,
                 value=max(float(default_off_ratio or 0.0), 0.0),
                 step=0.01,
+                format="%.2f",
             )
         with r2:
             mid_ratio = colored_input(
@@ -2792,6 +2858,7 @@ with left:
                 min_value=0.0,
                 value=max(float(default_mid_ratio or 0.0), 0.0),
                 step=0.01,
+                format="%.2f",
             )
         with r3:
             peak_ratio = colored_input(
@@ -2801,6 +2868,7 @@ with left:
                 min_value=0.0,
                 value=max(float(default_peak_ratio or 0.0), 0.0),
                 step=0.01,
+                format="%.2f",
             )
 
         auto_loads = avg_kw_to_timeband_loads(avg_base_kw, off_ratio, mid_ratio, peak_ratio)
@@ -3181,8 +3249,29 @@ with g2:
             y=tap_chart_df["평균 절감전력(kW)"].tolist(),
             text=[f"{v:.3f}" if float(v) != 0 else "0" for v in tap_chart_df["평균 절감전력(kW)"].tolist()],
             textposition="outside",
+            customdata=tap_chart_df[[
+                "계산 기준 전압(V)",
+                "전압 저감률(%)",
+                "절감률(%)",
+                "일 절감량(kWh)",
+                "연 절감량(kWh)",
+                "일 절감요금(원)",
+                "연 절감요금(원)",
+            ]].values,
+            hovertemplate=(
+                "탭=%{x}<br>"
+                "평균 절감전력=%{y:,.3f} kW<br>"
+                "계산 기준 전압=%{customdata[0]:,.1f} V<br>"
+                "전압 저감률=%{customdata[1]:.2f}%<br>"
+                "절감률=%{customdata[2]:.3f}%<br>"
+                "일 절감량=%{customdata[3]:,.3f} kWh<br>"
+                "연 절감량=%{customdata[4]:,.1f} kWh<br>"
+                "일 절감요금=%{customdata[5]:,.0f} 원<br>"
+                "연 절감요금=%{customdata[6]:,.0f} 원"
+                "<extra></extra>"
+            ),
         )
-        fig_bar.update_layout(title="탭별 예상 절감전력 비교")
+        fig_bar.update_layout(title="탭별 예상 절감전력 비교", hovermode="closest")
         fig_bar.update_xaxes(
             title_text="탭",
             autorange="reversed",
