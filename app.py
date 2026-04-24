@@ -3077,11 +3077,9 @@ active_days_per_year = get_active_days_per_year(
     include_holidays_as_shutdown=holiday_reflect,
 )
 
-loads_by_label = {
-    "경부하": off_peak_kw,
-    "중간부하": mid_peak_kw,
-    "최대부하": peak_kw,
-}
+# =========================================================
+# 파워플래너 시간대별 값 우선 계산 엔진
+# =========================================================
 if (
     st.session_state["pp_loaded"]
     and st.session_state["pp_off_peak_rate"] > 0
@@ -3099,55 +3097,98 @@ else:
     rate_table = safe_rate_table(primary_voltage_class)
 tariff_voltage_class = primary_voltage_class
 
-rows = []
+pp_profile_raw = st.session_state.get("pp_hourly_profile_kw", {})
+use_pp_hourly_engine = (
+    st.session_state.get("pp_loaded", False)
+    and input_mode == "파워플래너 자동 산출"
+    and isinstance(pp_profile_raw, dict)
+    and len(pp_profile_raw) >= 6
+)
+
+if use_pp_hourly_engine:
+    kw_by_hour_for_calc = {}
+    for h in range(24):
+        try:
+            val = float(pp_profile_raw.get(h, pp_profile_raw.get(str(h), 0.0)))
+        except Exception:
+            val = 0.0
+        kw_by_hour_for_calc[h] = max(val, 0.0)
+else:
+    loads_by_label = {
+        "경부하": off_peak_kw,
+        "중간부하": mid_peak_kw,
+        "최대부하": peak_kw,
+    }
+    kw_by_hour_for_calc = {
+        h: (loads_by_label[hour_to_label(h, season)] if h in active_hours else 0.0)
+        for h in range(24)
+    }
+
+if use_pp_hourly_engine:
+    band_values_positive = {"경부하": [], "중간부하": [], "최대부하": []}
+    band_energy_positive = {"경부하": 0.0, "중간부하": 0.0, "최대부하": 0.0}
+    positive_values = []
+    for h, kw in kw_by_hour_for_calc.items():
+        if h not in active_hours or kw <= 0:
+            continue
+        band = hour_to_label(h, season)
+        band_values_positive[band].append(kw)
+        band_energy_positive[band] += kw
+        positive_values.append(kw)
+
+    base_avg_for_ratio = (sum(positive_values) / len(positive_values)) if positive_values else 0.0
+    loads_by_label = {}
+    for label in ["경부하", "중간부하", "최대부하"]:
+        vals = band_values_positive[label]
+        loads_by_label[label] = (sum(vals) / len(vals)) if vals else 0.0
+
+    if base_avg_for_ratio > 0:
+        avg_base_kw = base_avg_for_ratio
+        off_peak_kw = loads_by_label["경부하"]
+        mid_peak_kw = loads_by_label["중간부하"]
+        peak_kw = loads_by_label["최대부하"]
+        off_ratio = off_peak_kw / avg_base_kw
+        mid_ratio = mid_peak_kw / avg_base_kw
+        peak_ratio = peak_kw / avg_base_kw
+
+    total_positive_energy = sum(band_energy_positive.values())
+    energy_share_by_label = {
+        label: (band_energy_positive[label] / total_positive_energy if total_positive_energy else 0.0)
+        for label in ["경부하", "중간부하", "최대부하"]
+    }
+else:
+    loads_by_label = {
+        "경부하": off_peak_kw,
+        "중간부하": mid_peak_kw,
+        "최대부하": peak_kw,
+    }
+    daily_energy_for_share = {
+        label: loads_by_label[label] * operating_hour_count[label]
+        for label in ["경부하", "중간부하", "최대부하"]
+    }
+    total_energy_for_share = sum(daily_energy_for_share.values())
+    energy_share_by_label = {
+        label: (daily_energy_for_share[label] / total_energy_for_share if total_energy_for_share else 0.0)
+        for label in ["경부하", "중간부하", "최대부하"]
+    }
+
+hour_rows = []
 daily_base_kwh = 0.0
 daily_saved_kwh = 0.0
 daily_cost_saving = 0.0
+band_calc = {
+    label: {"hours": 0, "base_kwh": 0.0, "saved_kwh": 0.0, "cost": 0.0, "kw_sum": 0.0, "kw_count": 0}
+    for label in ["경부하", "중간부하", "최대부하"]
+}
 
-for label in ["경부하", "중간부하", "최대부하"]:
-    hours = operating_hour_count[label]
-    load_kw = loads_by_label[label]
-    rate = rate_table[season][label]
-
-    saving_rate_pct, saved_kw, saved_kwh = calc_average_result(
-        load_kw, voltage_drop_pct, defaults["cvrf"], z, i, p, hours
-    )
-    base_kwh = load_kw * hours
-    cost_save = saved_kwh * rate
-
-    rows.append({
-        "구분": label,
-        "운영시간(h/day)": hours,
-        "평균부하(kW)": round(load_kw, 2),
-        "사용전력량(kWh/day)": round(base_kwh, 2),
-        "절감률(%)": round(saving_rate_pct, 3),
-        "절감전력(kW)": round(saved_kw, 2),
-        "절감전력량(kWh/day)": round(saved_kwh, 2),
-        "적용단가(원/kWh)": round(rate, 1),
-        "절감요금(원/day)": round(cost_save, 1),
-    })
-
-    daily_base_kwh += base_kwh
-    daily_saved_kwh += saved_kwh
-    daily_cost_saving += cost_save
-
-period_df = pd.DataFrame(rows)
-
-saving_rate_total = (daily_saved_kwh / daily_base_kwh * 100.0) if daily_base_kwh else 0.0
-day_operation_hours = sum(operating_hour_count.values())
-avg_saved_kw = (daily_saved_kwh / day_operation_hours) if day_operation_hours else 0.0
-monthly_saved_kwh = daily_saved_kwh * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
-yearly_saved_kwh = daily_saved_kwh * active_days_per_year
-monthly_cost_saving = daily_cost_saving * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
-yearly_cost_saving = daily_cost_saving * active_days_per_year
-
-hour_rows = []
 for h in range(24):
     label = hour_to_label(h, season)
     operating = h in active_hours
-    kw = loads_by_label[label] if operating else 0.0
+    kw = kw_by_hour_for_calc.get(h, 0.0) if operating else 0.0
     rate = rate_table[season][label]
     saving_rate_pct, saved_kw, saved_kwh = calc_average_result(kw, voltage_drop_pct, defaults["cvrf"], z, i, p, 1.0)
+    cost_save = saved_kwh * rate
+
     hour_rows.append({
         "시간": "{0:02d}:00".format(h),
         "시간번호": h,
@@ -3158,19 +3199,65 @@ for h in range(24):
         "절감전력(kW)": round(saved_kw, 3),
         "절감전력량(kWh)": round(saved_kwh, 3),
         "요금단가(원/kWh)": round(rate, 1),
-        "절감요금(원)": round(saved_kwh * rate, 1),
+        "절감요금(원)": round(cost_save, 1),
     })
+
+    include_for_summary = operating and (kw > 0 if use_pp_hourly_engine else True)
+    if include_for_summary:
+        band_calc[label]["hours"] += 1
+        band_calc[label]["base_kwh"] += kw
+        band_calc[label]["saved_kwh"] += saved_kwh
+        band_calc[label]["cost"] += cost_save
+        band_calc[label]["kw_sum"] += kw
+        band_calc[label]["kw_count"] += 1
+        daily_base_kwh += kw
+        daily_saved_kwh += saved_kwh
+        daily_cost_saving += cost_save
 
 hourly_df = pd.DataFrame(hour_rows)
 
-# 탭별 비교표
+rows = []
+for label in ["경부하", "중간부하", "최대부하"]:
+    summary_hours = band_calc[label]["hours"]
+    avg_kw_label = (
+        band_calc[label]["kw_sum"] / band_calc[label]["kw_count"]
+        if band_calc[label]["kw_count"] > 0
+        else loads_by_label.get(label, 0.0)
+    )
+    base_kwh = band_calc[label]["base_kwh"]
+    saved_kwh = band_calc[label]["saved_kwh"]
+    cost_save = band_calc[label]["cost"]
+    saving_rate_pct = (saved_kwh / base_kwh * 100.0) if base_kwh else 0.0
+    saved_kw = (saved_kwh / summary_hours) if summary_hours else 0.0
+
+    rows.append({
+        "구분": label,
+        "운영시간(h/day)": summary_hours,
+        "평균부하(kW)": round(avg_kw_label, 2),
+        "사용전력량(kWh/day)": round(base_kwh, 2),
+        "절감률(%)": round(saving_rate_pct, 3),
+        "절감전력(kW)": round(saved_kw, 2),
+        "절감전력량(kWh/day)": round(saved_kwh, 2),
+        "적용단가(원/kWh)": round(rate_table[season][label], 1),
+        "절감요금(원/day)": round(cost_save, 1),
+        "kWh비중(%)": round(energy_share_by_label.get(label, 0.0) * 100.0, 2),
+    })
+
+period_df = pd.DataFrame(rows)
+
+saving_rate_total = (daily_saved_kwh / daily_base_kwh * 100.0) if daily_base_kwh else 0.0
+day_operation_hours = sum(band_calc[label]["hours"] for label in ["경부하", "중간부하", "최대부하"])
+avg_saved_kw = (daily_saved_kwh / day_operation_hours) if day_operation_hours else 0.0
+monthly_saved_kwh = daily_saved_kwh * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
+yearly_saved_kwh = daily_saved_kwh * active_days_per_year
+monthly_cost_saving = daily_cost_saving * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
+yearly_cost_saving = daily_cost_saving * active_days_per_year
+
 max_compare_drop_pct = 7.5
 tap_compare_rows = []
 current_tap_int = int(current_tap)
-
-# 현재 탭(기준점)도 함께 표시
 base_compare_voltage = current_voltage_for_calc
-base_compare_row = {
+tap_compare_rows.append({
     "탭": current_tap_int,
     "계산 기준 전압(V)": round(base_compare_voltage, 1),
     "전압 저감률(%)": 0.0,
@@ -3180,8 +3267,7 @@ base_compare_row = {
     "연 절감량(kWh)": 0.0,
     "일 절감요금(원)": 0.0,
     "연 절감요금(원)": 0.0,
-}
-tap_compare_rows.append(base_compare_row)
+})
 
 for tap in range(max(current_tap_int - 1, 1), 0, -1):
     delta_steps = max(current_tap_int - int(tap), 0)
@@ -3189,28 +3275,27 @@ for tap in range(max(current_tap_int - 1, 1), 0, -1):
     if tap_voltage_drop_pct < 1.25 or tap_voltage_drop_pct > max_compare_drop_pct:
         continue
     tap_new_voltage = current_voltage_for_calc * (1 - tap_voltage_drop_pct / 100.0)
-
     tap_daily_saved_kwh = 0.0
     tap_daily_cost = 0.0
+    tap_base_kwh = 0.0
+    tap_hours = 0
 
-    for label in ["경부하", "중간부하", "최대부하"]:
-        hours = operating_hour_count[label]
-        load_kw = loads_by_label[label]
+    for h in range(24):
+        if h not in active_hours:
+            continue
+        kw = kw_by_hour_for_calc.get(h, 0.0)
+        if use_pp_hourly_engine and kw <= 0:
+            continue
+        label = hour_to_label(h, season)
         rate = rate_table[season][label]
-        tap_saving_rate_pct, tap_saved_kw, tap_saved_kwh = calc_average_result(
-            load_kw,
-            tap_voltage_drop_pct,
-            defaults["cvrf"],
-            z,
-            i,
-            p,
-            hours
-        )
+        _, _, tap_saved_kwh = calc_average_result(kw, tap_voltage_drop_pct, defaults["cvrf"], z, i, p, 1.0)
         tap_daily_saved_kwh += tap_saved_kwh
         tap_daily_cost += tap_saved_kwh * rate
+        tap_base_kwh += kw
+        tap_hours += 1
 
-    tap_avg_saved_kw = (tap_daily_saved_kwh / day_operation_hours) if day_operation_hours else 0.0
-    tap_saving_rate_total = (tap_daily_saved_kwh / daily_base_kwh * 100.0) if daily_base_kwh else 0.0
+    tap_avg_saved_kw = (tap_daily_saved_kwh / tap_hours) if tap_hours else 0.0
+    tap_saving_rate_total = (tap_daily_saved_kwh / tap_base_kwh * 100.0) if tap_base_kwh else 0.0
     tap_yearly_saved_kwh = tap_daily_saved_kwh * active_days_per_year
     tap_yearly_cost = tap_daily_cost * active_days_per_year
 
@@ -3231,16 +3316,10 @@ if not tap_compare_df.empty:
     tap_compare_df = tap_compare_df[
         (tap_compare_df["탭"] == current_tap_int) |
         (tap_compare_df["전압 저감률(%)"] == 0.0) |
-        (
-            (tap_compare_df["전압 저감률(%)"] >= 1.25) &
-            (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct)
-        )
+        ((tap_compare_df["전압 저감률(%)"] >= 1.25) & (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct))
     ].copy()
     tap_compare_df = tap_compare_df.drop_duplicates(subset=["탭"], keep="first")
-    tap_compare_df = tap_compare_df.sort_values(
-        by=["탭"],
-        ascending=[False]
-    ).reset_index(drop=True)
+    tap_compare_df = tap_compare_df.sort_values(by=["탭"], ascending=[False]).reset_index(drop=True)
 
 # 요약 데이터프레임
 rate_summary_df = pd.DataFrame({
