@@ -1058,9 +1058,9 @@ def _summarize_by_actual_load_level(hourly_profile_kw):
 
 def summarize_band_loads_from_hourly(hourly_map, season):
     """
-    파워플래너 시간대별 사용량을 기준으로 평균부하와 경/중/최 비율을 계산한다.
-    기본은 한전 계절별 시간대 구분표 기준.
-    단, 최대부하 시간대 값이 거의 0인데 실제 그래프에는 피크가 있으면 실제 부하 크기 기준으로 보정한다.
+    파워플래너의 계절별 시간대 구분표 그대로 경/중/최대부하를 산출한다.
+    여기서는 실제 부하 크기 순위로 재분류하지 않는다.
+    즉, 파워플래너와 비교 가능한 값이 되도록 시간대 기준을 유지한다.
     """
     hourly_profile_kw = aggregate_hourly_profile_kw(hourly_map)
     if not hourly_profile_kw:
@@ -1070,47 +1070,40 @@ def summarize_band_loads_from_hourly(hourly_map, season):
     if not positive_values:
         return None
 
-    base_avg_kw = sum(positive_values) / len(positive_values)
+    # 24시간 자료가 있으면 0값도 포함하여 하루 평균부하를 계산한다.
+    # 파워플래너 시간대별 자료에서 12~24시가 0이면 그 0도 실제 자료로 취급한다.
+    denominator_hours = 24 if len(hourly_profile_kw) >= 12 else len(hourly_profile_kw)
+    base_avg_kw = sum(float(hourly_profile_kw.get(h, 0.0)) for h in range(24)) / denominator_hours
+    if base_avg_kw <= 0:
+        base_avg_kw = sum(positive_values) / len(positive_values)
     if base_avg_kw <= 0:
         return None
 
     band_buckets = {"경부하": [], "중간부하": [], "최대부하": []}
-    for hour, kw in hourly_profile_kw.items():
-        band = hour_to_label(hour, season if season in SEASON_SCHEDULE else "봄·가을")
+    target_season = season if season in SEASON_SCHEDULE else month_to_season(datetime.now().month)
+
+    for hour in range(24):
+        kw = float(hourly_profile_kw.get(hour, 0.0))
+        band = hour_to_label(hour, target_season)
         band_buckets[band].append(kw)
 
     band_avg = {}
     for label in ["경부하", "중간부하", "최대부하"]:
-        vals = [v for v in band_buckets[label] if v > 0]
+        vals = band_buckets[label]
         band_avg[label] = (sum(vals) / len(vals)) if vals else 0.0
-
-    max_kw = max(positive_values)
-    peak_ratio_raw = band_avg["최대부하"] / base_avg_kw if base_avg_kw else 0.0
-
-    if peak_ratio_raw < 0.10 and max_kw >= base_avg_kw * 1.20:
-        by_level = _summarize_by_actual_load_level(hourly_profile_kw)
-        if by_level:
-            return by_level
-
-    for label in ["경부하", "중간부하", "최대부하"]:
-        if band_avg[label] <= 0:
-            band_avg[label] = base_avg_kw
-
-    off_ratio = band_avg["경부하"] / base_avg_kw if base_avg_kw else 1.0
-    mid_ratio = band_avg["중간부하"] / base_avg_kw if base_avg_kw else 1.0
-    peak_ratio = band_avg["최대부하"] / base_avg_kw if base_avg_kw else 1.0
 
     return {
         "base_avg_kw": round(base_avg_kw, 3),
         "off_peak_kw": round(band_avg["경부하"], 3),
         "mid_peak_kw": round(band_avg["중간부하"], 3),
         "peak_kw": round(band_avg["최대부하"], 3),
-        "off_ratio": round(off_ratio, 4),
-        "mid_ratio": round(mid_ratio, 4),
-        "peak_ratio": round(peak_ratio, 4),
+        "off_ratio": round(band_avg["경부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
+        "mid_ratio": round(band_avg["중간부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
+        "peak_ratio": round(band_avg["최대부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
         "hourly_profile_kw": hourly_profile_kw,
-        "source": "tou_timeband" if peak_ratio_raw >= 0.10 else "tou_timeband_fallback",
+        "source": "powerplanner_tou_hourly",
     }
+
 
 def select_15min_view_if_available(driver, by, logs, label):
     try:
@@ -1609,8 +1602,152 @@ def scrape_hourly_usage_page(page, result, logs):
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
 
+
+def flatten_columns_for_powerplanner(df):
+    work = df.copy().fillna(0)
+    try:
+        if isinstance(work.columns, pd.MultiIndex):
+            cols = []
+            for col in work.columns:
+                parts = [normalize_space(str(x)) for x in col if normalize_space(str(x)) and str(x).lower() != "nan"]
+                cols.append(" ".join(parts))
+            work.columns = cols
+        else:
+            work.columns = [normalize_space(c) for c in work.columns]
+    except Exception:
+        work.columns = [normalize_space(c) for c in work.columns]
+    return work
+
+
+def extract_daily_timeband_energy_summary(tables, season=None):
+    """
+    파워플래너 일별요금 표의 전력사용량(kWh) 경/중/최대부하 컬럼을 직접 합산한다.
+    시간대별 순간 패턴보다 파워플래너 요금표에 쓰이는 구간별 kWh가 우선이다.
+    """
+    target_season = season if season in SEASON_SCHEDULE else month_to_season(datetime.now().month)
+    schedule = SEASON_SCHEDULE[target_season]
+    band_hours = {label: max(len(hours), 1) for label, hours in schedule.items()}
+
+    best = None
+    for df in tables:
+        sig = table_signature(df)
+        if not ("전력사용량" in sig and "중간부하" in sig and "경부하" in sig and "최대부하" in sig):
+            continue
+
+        work = flatten_columns_for_powerplanner(df)
+        cols = list(work.columns)
+        usage_cols = {}
+
+        # MultiIndex가 제대로 유지된 경우: "전력사용량(kWh) 중간부하" 형태를 우선 사용
+        for band in ["경부하", "중간부하", "최대부하"]:
+            candidates = [c for c in cols if "전력사용량" in c and band in c]
+            if candidates:
+                usage_cols[band] = candidates[0]
+
+        # read_html이 헤더를 단순화해서 "중간부하/최대부하/경부하"가 반복된 경우 위치 기반 보정
+        if len(usage_cols) < 3:
+            band_only = [i for i, c in enumerate(cols) if any(b in c for b in ["경부하", "중간부하", "최대부하"])]
+            # 일별요금 표는 보통 [최대수요, 전력사용량 3개, 전력량요금 4개] 순서다.
+            # 첫 번째로 등장하는 경/중/최대부하 묶음을 전력사용량(kWh)로 본다.
+            first_group = []
+            for i in band_only:
+                c = cols[i]
+                if any(b in c for b in ["경부하", "중간부하", "최대부하"]):
+                    first_group.append((i, c))
+                if len(first_group) >= 3:
+                    break
+            for i, c in first_group:
+                for band in ["경부하", "중간부하", "최대부하"]:
+                    if band in c and band not in usage_cols:
+                        usage_cols[band] = c
+
+        if len(usage_cols) < 3:
+            continue
+
+        date_col = None
+        for c in cols:
+            if "일자" in c or normalize_key(c) in ["일", "날짜"]:
+                date_col = c
+                break
+
+        totals = {"경부하": 0.0, "중간부하": 0.0, "최대부하": 0.0}
+        valid_days = 0
+        rows_used = 0
+
+        for _, row in work.iterrows():
+            if date_col:
+                date_text = normalize_space(row.get(date_col, ""))
+                # 04.24처럼 조회 당일 이후 0행도 있으므로 총합 0인 행은 제외한다.
+                if date_text and not re.search(r"\d", date_text):
+                    continue
+
+            vals = {band: parse_number(row.get(col, 0)) for band, col in usage_cols.items()}
+            row_total = sum(vals.values())
+            if row_total <= 0:
+                continue
+
+            for band in totals:
+                totals[band] += vals[band]
+            valid_days += 1
+            rows_used += 1
+
+        if rows_used <= 0 or sum(totals.values()) <= 0:
+            continue
+
+        # 일별요금 월 조회 표이므로 유효 일수로 나눠 1일 평균 kWh → 시간대별 평균 kW로 변환
+        band_avg_kw = {}
+        for band in ["경부하", "중간부하", "최대부하"]:
+            daily_kwh = totals[band] / valid_days
+            band_avg_kw[band] = daily_kwh / band_hours[band]
+
+        base_avg_kw = (sum(totals.values()) / valid_days) / 24.0
+        if base_avg_kw <= 0:
+            continue
+
+        summary = {
+            "base_avg_kw": round(base_avg_kw, 3),
+            "off_peak_kw": round(band_avg_kw["경부하"], 3),
+            "mid_peak_kw": round(band_avg_kw["중간부하"], 3),
+            "peak_kw": round(band_avg_kw["최대부하"], 3),
+            "off_ratio": round(band_avg_kw["경부하"] / base_avg_kw, 4),
+            "mid_ratio": round(band_avg_kw["중간부하"] / base_avg_kw, 4),
+            "peak_ratio": round(band_avg_kw["최대부하"] / base_avg_kw, 4),
+            "daily_band_kwh": {band: round(totals[band] / valid_days, 3) for band in totals},
+            "monthly_band_kwh": {band: round(totals[band], 3) for band in totals},
+            "valid_days": valid_days,
+            "source": "powerplanner_daily_bill_timeband",
+        }
+        if best is None or valid_days > best.get("valid_days", 0):
+            best = summary
+
+    return best
+
+
 def scrape_daily_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="일별 사용량")
+
+    # 파워플래너 일별요금 표의 경/중/최대부하 kWh를 최우선으로 반영한다.
+    # 이 값은 파워플래너 요금계산에 직접 쓰이는 시간대 구분값이므로, CVR 계산에서도 가장 신뢰도가 높다.
+    daily_band_summary = extract_daily_timeband_energy_summary(tables, season=month_to_season(datetime.now().month))
+    if daily_band_summary:
+        result["auto_avg_base_kw"] = daily_band_summary["base_avg_kw"]
+        result["auto_off_peak_kw"] = daily_band_summary["off_peak_kw"]
+        result["auto_mid_peak_kw"] = daily_band_summary["mid_peak_kw"]
+        result["auto_peak_kw"] = daily_band_summary["peak_kw"]
+        result["auto_off_ratio"] = daily_band_summary["off_ratio"]
+        result["auto_mid_ratio"] = daily_band_summary["mid_ratio"]
+        result["auto_peak_ratio"] = daily_band_summary["peak_ratio"]
+        result["auto_source"] = "daily_bill_timeband"
+        add_log(
+            logs,
+            "일별요금 경/중/최대부하 kWh 기준 자동 산출 반영: "
+            f"평균 {daily_band_summary['base_avg_kw']:,.1f} kW / "
+            f"경 {daily_band_summary['off_peak_kw']:,.1f} / "
+            f"중 {daily_band_summary['mid_peak_kw']:,.1f} / "
+            f"최대 {daily_band_summary['peak_kw']:,.1f} kW "
+            f"({daily_band_summary['valid_days']}일 기준)"
+        )
+
     md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
