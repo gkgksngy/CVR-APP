@@ -259,6 +259,8 @@ def build_chrome_driver(logs):
 
     options = Options()
     options.binary_location = chrome_binary
+    # 빠른 로딩: 이미지/폰트까지 모두 기다리지 않고 DOM이 뜨면 진행
+    options.page_load_strategy = "eager"
 
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -274,6 +276,11 @@ def build_chrome_driver(logs):
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--lang=ko-KR")
     options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    # 파워플래너 값 추출에는 이미지가 필요 없으므로 네트워크 로딩량 감소
+    options.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    })
 
     tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
     tmp_data = tempfile.mkdtemp(prefix="chrome-data-")
@@ -290,8 +297,8 @@ def build_chrome_driver(logs):
         else:
             driver = webdriver.Chrome(options=options)
 
-        driver.set_page_load_timeout(40)
-        driver.implicitly_wait(2)
+        driver.set_page_load_timeout(18)
+        driver.implicitly_wait(0.5)
         return driver
     except Exception:
         shutil.rmtree(tmp_profile, ignore_errors=True)
@@ -1049,14 +1056,14 @@ def select_15min_view_if_available(driver, by, logs, label):
         ]
         clicked = click_first(driver, radio_selectors, logs, f'{label} 15분 선택')
         if clicked:
-            time.sleep(0.6)
+            time.sleep(0.25)
             search_selectors = [
                 (by.XPATH, "//button[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
                 (by.XPATH, "//a[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
                 (by.CSS_SELECTOR, "button"),
             ]
             click_first(driver, search_selectors, logs, f'{label} 조회 버튼')
-            time.sleep(1.2)
+            time.sleep(0.5)
     except Exception as e:
         add_log(logs, f'{label} 15분 기준 설정 실패(무시): {e}')
 
@@ -1374,17 +1381,33 @@ def extract_max_demand_from_text(text):
     return max(values) if values else 0.0
 
 
+def fetch_and_parse_powerplanner_page(driver, wait, by, page_meta, result, logs):
+    page = visit_powerplanner_page(
+        driver=driver,
+        wait=wait,
+        by=by,
+        url=page_meta["url"],
+        logs=logs,
+        label=page_meta["label"],
+        ready_patterns=page_meta.get("ready"),
+        post_load=page_meta.get("post_load"),
+    )
+    parser = page_meta.get("parser")
+    if parser is not None:
+        parser(page, result, logs)
+
+
 def visit_powerplanner_page(driver, wait, by, url, logs, label, ready_patterns=None, post_load=None):
     driver.get(url)
     wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
     wait.until(lambda d: len(d.find_elements(by.TAG_NAME, "body")) > 0)
-    time.sleep(1.2)
+    time.sleep(0.35)
 
     if callable(post_load):
         try:
             post_load(driver, by, logs, label)
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-            time.sleep(0.8)
+            time.sleep(0.3)
         except Exception as e:
             add_log(logs, f"{label} 후처리 실패(무시): {e}")
 
@@ -1665,7 +1688,7 @@ def scrape_kepco_power_planner(user_id, user_pw):
         add_log(logs, "chromedriver version: {0}".format(env_info["chromedriver_version"]))
 
         driver = build_chrome_driver(logs)
-        wait = WebDriverWait(driver, 30)
+        wait = WebDriverWait(driver, 15)
 
         login_url = "https://pp.kepco.co.kr/intro.do"
         driver.get(login_url)
@@ -1708,7 +1731,7 @@ def scrape_kepco_power_planner(user_id, user_pw):
             return {"status": "error", "message": "로그인 버튼 selector를 찾지 못했습니다.", "logs": "\n".join(logs)}
 
         wait.until(lambda d: "Logout" in d.page_source or "스마트뷰" in d.page_source or "고객정보" in d.page_source)
-        time.sleep(2)
+        time.sleep(0.8)
         add_log(logs, "로그인 성공 및 메인 진입 확인")
 
         result = {
@@ -1737,17 +1760,21 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "auto_source": "",
         }
 
-        pages_to_visit = [
+        # 속도 최적화 핵심:
+        # 1) 필수 화면만 먼저 접속
+        # 2) 값이 부족할 때만 보조 화면을 추가 접속
+        # 기존처럼 모든 화면을 무조건 순회하면 사업장/서버 상태에 따라 1~2분까지 늘어날 수 있음
+        essential_pages = [
             {
                 "label": "스마트뷰",
                 "url": "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101",
-                "ready": ["스마트뷰", "실시간사용량"],
+                "ready": ["스마트뷰"],
                 "parser": scrape_smartview_page,
             },
             {
                 "label": "고객정보",
                 "url": "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601",
-                "ready": ["고객정보", "계약종별"],
+                "ready": ["고객정보"],
                 "parser": scrape_customer_info_page,
             },
             {
@@ -1758,47 +1785,10 @@ def scrape_kepco_power_planner(user_id, user_pw):
                 "parser": scrape_hourly_usage_page,
             },
             {
-                "label": "시간대별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
-                "ready": ["시간대별", "패턴기간"],
-                "post_load": select_15min_view_if_available,
-                "parser": scrape_pattern_hourly_page,
-            },
-            {
-                "label": "일별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0102.do?menu_id=O010202",
-                "ready": ["일별", "사용량"],
-                "parser": scrape_daily_usage_page,
-            },
-            {
                 "label": "월별 사용량",
                 "url": "https://pp.kepco.co.kr/rs/rs0103.do?menu_id=O010203",
                 "ready": ["월별", "사용량"],
                 "parser": scrape_monthly_usage_page,
-            },
-            {
-                "label": "연도별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204",
-                "ready": ["연도별", "사용량"],
-                "parser": scrape_yearly_usage_page,
-            },
-            {
-                "label": "요일별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0102.do?menu_id=O010302",
-                "ready": ["요일별", "패턴기간"],
-                "parser": None,
-            },
-            {
-                "label": "월별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0103.do?menu_id=O010303",
-                "ready": ["월별", "패턴기간"],
-                "parser": None,
-            },
-            {
-                "label": "실시간·예상요금",
-                "url": "https://pp.kepco.co.kr/pr/pr0101.do?menu_id=O010401",
-                "ready": ["실시간", "예상"],
-                "parser": scrape_realtime_charge_page,
             },
             {
                 "label": "시간대별요금",
@@ -1808,21 +1798,56 @@ def scrape_kepco_power_planner(user_id, user_pw):
             },
         ]
 
-        for page_meta in pages_to_visit:
+        fallback_pages = [
+            {
+                "label": "시간대별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
+                "ready": ["시간대별", "패턴기간"],
+                "post_load": select_15min_view_if_available,
+                "parser": scrape_pattern_hourly_page,
+                "need": lambda r: r.get("auto_avg_base_kw", 0.0) <= 0,
+            },
+            {
+                "label": "연도별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204",
+                "ready": ["연도별", "사용량"],
+                "parser": scrape_yearly_usage_page,
+                "need": lambda r: r.get("annual_usage_kwh", 0.0) <= 0,
+            },
+            {
+                "label": "일별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0102.do?menu_id=O010202",
+                "ready": ["일별", "사용량"],
+                "parser": scrape_daily_usage_page,
+                "need": lambda r: r.get("max_demand_kw", 0.0) <= 0,
+            },
+            {
+                "label": "실시간·예상요금",
+                "url": "https://pp.kepco.co.kr/pr/pr0101.do?menu_id=O010401",
+                "ready": ["실시간", "예상"],
+                "parser": scrape_realtime_charge_page,
+                "need": lambda r: (
+                    r.get("off_peak_rate", 0.0) <= 0
+                    or r.get("mid_peak_rate", 0.0) <= 0
+                    or r.get("peak_rate", 0.0) <= 0
+                    or r.get("basic_charge_unit", 0.0) <= 0
+                ),
+            },
+        ]
+
+        for page_meta in essential_pages:
             try:
-                page = visit_powerplanner_page(
-                    driver=driver,
-                    wait=wait,
-                    by=By,
-                    url=page_meta["url"],
-                    logs=logs,
-                    label=page_meta["label"],
-                    ready_patterns=page_meta.get("ready"),
-                    post_load=page_meta.get("post_load"),
-                )
-                parser = page_meta.get("parser")
-                if parser is not None:
-                    parser(page, result, logs)
+                fetch_and_parse_powerplanner_page(driver, wait, By, page_meta, result, logs)
+            except Exception as page_error:
+                add_log(logs, f"{page_meta['label']} 처리 실패: {page_error}")
+                add_log(logs, traceback.format_exc())
+
+        for page_meta in fallback_pages:
+            try:
+                if not page_meta.get("need", lambda r: True)(result):
+                    add_log(logs, f"{page_meta['label']} 생략: 이미 필요한 값 확보")
+                    continue
+                fetch_and_parse_powerplanner_page(driver, wait, By, page_meta, result, logs)
             except Exception as page_error:
                 add_log(logs, f"{page_meta['label']} 처리 실패: {page_error}")
                 add_log(logs, traceback.format_exc())
@@ -2755,8 +2780,8 @@ with left:
                 "경부하 비율",
                 st.number_input,
                 ratio_color,
-                min_value=0.10,
-                value=float(default_off_ratio or 1.0),
+                min_value=0.0,
+                value=max(float(default_off_ratio or 0.0), 0.0),
                 step=0.01,
             )
         with r2:
@@ -2764,8 +2789,8 @@ with left:
                 "중간부하 비율",
                 st.number_input,
                 ratio_color,
-                min_value=0.10,
-                value=float(default_mid_ratio or 1.0),
+                min_value=0.0,
+                value=max(float(default_mid_ratio or 0.0), 0.0),
                 step=0.01,
             )
         with r3:
@@ -2773,8 +2798,8 @@ with left:
                 "최대부하 비율",
                 st.number_input,
                 ratio_color,
-                min_value=0.10,
-                value=float(default_peak_ratio or 1.0),
+                min_value=0.0,
+                value=max(float(default_peak_ratio or 0.0), 0.0),
                 step=0.01,
             )
 
@@ -3202,62 +3227,8 @@ excel_output.seek(0)
 pdf_error = None
 pdf_bytes = None
 
-try:
-    pdf_font_info = get_korean_font_info()
-    fig_line_buf = create_matplotlib_line_chart(graph_df, font_info=pdf_font_info)
-    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, font_info=pdf_font_info)
-
-    pdf_bytes = build_pdf_bytes_report(
-        site_name=site_name,
-        season=season,
-        created_at_text=created_at_text,
-        calc_voltage_basis=calc_voltage_basis,
-        primary_voltage_kv=primary_voltage_kv,
-        secondary_voltage_v=secondary_voltage_v,
-        new_voltage=new_voltage,
-        current_voltage_for_calc=current_voltage_for_calc,
-        voltage_drop_pct=voltage_drop_pct,
-        voltage_drop_v=voltage_drop_v,
-        primary_voltage_class=primary_voltage_class,
-        tariff_voltage_class=tariff_voltage_class,
-        contract_kind=contract_kind_display,
-        tariff_choice_desc=tariff_choice_desc,
-        cvrf_value=defaults["cvrf"],
-        z=z,
-        i=i,
-        p=p,
-        correction_factor=correction_factor,
-        reliability_text=reliability_text,
-        current_tap=current_tap,
-        target_tap=target_tap,
-        tap_step_percent=tap_step_percent,
-        avg_saved_kw=avg_saved_kw,
-        saving_rate_total=saving_rate_total,
-        daily_saved_kwh=daily_saved_kwh,
-        monthly_saved_kwh=monthly_saved_kwh,
-        yearly_saved_kwh=yearly_saved_kwh,
-        daily_cost_saving=daily_cost_saving,
-        monthly_cost_saving=monthly_cost_saving,
-        yearly_cost_saving=yearly_cost_saving,
-        operation_mode=operation_mode,
-        operating_start=operating_start,
-        operating_end=operating_end,
-        day_operation_hours=day_operation_hours,
-        active_days_per_year=active_days_per_year,
-        holiday_reflect=holiday_reflect,
-        holiday_count=holiday_count,
-        load_unit=load_unit,
-        load_summary_df=load_summary_df,
-        period_df=period_df,
-        hourly_pdf_df=hourly_df,
-        rate_summary_df=rate_summary_df,
-        season_time_band_df=season_time_band_df,
-        tap_compare_df=tap_compare_df,
-        fig_line_buf=fig_line_buf,
-        fig_bar_buf=fig_bar_buf,
-    )
-except Exception as e:
-    pdf_error = str(e)
+# PDF는 생성 시간이 길기 때문에 화면 재계산 때마다 만들지 않고,
+# 아래 PDF 저장 버튼을 누른 경우에만 생성한다.
 
 col_excel, col_pdf = st.columns(2)
 
@@ -3270,13 +3241,66 @@ with col_excel:
     )
 
 with col_pdf:
-    if pdf_bytes is not None:
-        st.download_button(
-            "📄 PDF 저장",
-            data=pdf_bytes,
-            file_name="CVR보고서_{0}_{1}.pdf".format(site_name, datetime.now().strftime("%Y%m%d_%H%M%S")),
-            mime="application/pdf",
-        )
-    else:
-        st.button("📄 PDF 저장", disabled=True)
-        st.error("PDF 생성 실패: {0}".format(pdf_error if pdf_error else "알 수 없는 오류"))
+    if st.button("📄 PDF 생성"):
+        try:
+            pdf_font_info = get_korean_font_info()
+            fig_line_buf = create_matplotlib_line_chart(graph_df, font_info=pdf_font_info)
+            fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, font_info=pdf_font_info)
+
+            pdf_bytes = build_pdf_bytes_report(
+                site_name=site_name,
+                season=season,
+                created_at_text=created_at_text,
+                calc_voltage_basis=calc_voltage_basis,
+                primary_voltage_kv=primary_voltage_kv,
+                secondary_voltage_v=secondary_voltage_v,
+                new_voltage=new_voltage,
+                current_voltage_for_calc=current_voltage_for_calc,
+                voltage_drop_pct=voltage_drop_pct,
+                voltage_drop_v=voltage_drop_v,
+                primary_voltage_class=primary_voltage_class,
+                tariff_voltage_class=tariff_voltage_class,
+                contract_kind=contract_kind_display,
+                tariff_choice_desc=tariff_choice_desc,
+                cvrf_value=defaults["cvrf"],
+                z=z,
+                i=i,
+                p=p,
+                correction_factor=correction_factor,
+                reliability_text=reliability_text,
+                current_tap=current_tap,
+                target_tap=target_tap,
+                tap_step_percent=tap_step_percent,
+                avg_saved_kw=avg_saved_kw,
+                saving_rate_total=saving_rate_total,
+                daily_saved_kwh=daily_saved_kwh,
+                monthly_saved_kwh=monthly_saved_kwh,
+                yearly_saved_kwh=yearly_saved_kwh,
+                daily_cost_saving=daily_cost_saving,
+                monthly_cost_saving=monthly_cost_saving,
+                yearly_cost_saving=yearly_cost_saving,
+                operation_mode=operation_mode,
+                operating_start=operating_start,
+                operating_end=operating_end,
+                day_operation_hours=day_operation_hours,
+                active_days_per_year=active_days_per_year,
+                holiday_reflect=holiday_reflect,
+                holiday_count=holiday_count,
+                load_unit=load_unit,
+                load_summary_df=load_summary_df,
+                period_df=period_df,
+                hourly_pdf_df=hourly_df,
+                rate_summary_df=rate_summary_df,
+                season_time_band_df=season_time_band_df,
+                tap_compare_df=tap_compare_df,
+                fig_line_buf=fig_line_buf,
+                fig_bar_buf=fig_bar_buf,
+            )
+            st.download_button(
+                "📄 PDF 다운로드",
+                data=pdf_bytes,
+                file_name="CVR보고서_{0}_{1}.pdf".format(site_name, datetime.now().strftime("%Y%m%d_%H%M%S")),
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.error("PDF 생성 실패: {0}".format(str(e)))
