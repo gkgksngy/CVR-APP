@@ -79,9 +79,6 @@ DEFAULT_STATE = {
     "pp_auto_mid_ratio": 0.0,
     "pp_auto_peak_ratio": 0.0,
     "pp_hourly_profile_kw": {},
-    "pp_daily_band_kwh": {},
-    "pp_monthly_band_kwh": {},
-    "pp_auto_source": "",
 }
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
@@ -101,10 +98,9 @@ LOAD_TYPES = {
 
 SEASON_SCHEDULE = {
     "봄·가을": {
-        # 파워플래너 시간대별 구분표 기준
-        "경부하": list(range(23, 24)) + list(range(0, 8)),
-        "중간부하": list(range(8, 11)) + list(range(13, 18)) + [22],
-        "최대부하": list(range(11, 13)) + list(range(18, 22)),
+        "경부하": list(range(23, 24)) + list(range(0, 9)),
+        "중간부하": [9, 10, 11, 13, 14, 15, 16, 20, 21, 22],
+        "최대부하": [12, 17, 18, 19],
     },
     "여름": {
         "경부하": list(range(23, 24)) + list(range(0, 9)),
@@ -263,8 +259,6 @@ def build_chrome_driver(logs):
 
     options = Options()
     options.binary_location = chrome_binary
-    # 빠른 로딩: 이미지/폰트까지 모두 기다리지 않고 DOM이 뜨면 진행
-    options.page_load_strategy = "eager"
 
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -280,11 +274,6 @@ def build_chrome_driver(logs):
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--lang=ko-KR")
     options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-    # 파워플래너 값 추출에는 이미지가 필요 없으므로 네트워크 로딩량 감소
-    options.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.default_content_setting_values.notifications": 2,
-    })
 
     tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
     tmp_data = tempfile.mkdtemp(prefix="chrome-data-")
@@ -301,8 +290,8 @@ def build_chrome_driver(logs):
         else:
             driver = webdriver.Chrome(options=options)
 
-        driver.set_page_load_timeout(18)
-        driver.implicitly_wait(0.5)
+        driver.set_page_load_timeout(40)
+        driver.implicitly_wait(2)
         return driver
     except Exception:
         shutil.rmtree(tmp_profile, ignore_errors=True)
@@ -1006,118 +995,49 @@ def aggregate_hourly_profile_kw(hourly_map):
     return {h: round(sum(vals) / len(vals), 3) for h, vals in sorted(buckets.items()) if vals}
 
 
-def _summarize_by_actual_load_level(hourly_profile_kw):
-    """
-    시간표가 아니라 실제 24시간 부하 크기 기준으로 경/중/최대부하 평균을 나눈다.
-    최대부하 시간대가 0.00으로 무너지는 경우를 방지하기 위한 보정 로직이다.
-    """
-    values = [float(v) for v in hourly_profile_kw.values() if float(v) > 0]
-    if not values:
-        return None
-
-    base_avg_kw = sum(values) / len(values)
-    max_kw = max(values)
-    if base_avg_kw <= 0 or max_kw <= 0:
-        return None
-
-    peak_vals = [v for v in values if v >= max_kw * 0.85]
-    mid_vals = [v for v in values if max_kw * 0.45 <= v < max_kw * 0.85]
-    off_vals = [v for v in values if v < max_kw * 0.45]
-
-    if not peak_vals or not mid_vals or not off_vals:
-        ordered = sorted(values)
-        n = len(ordered)
-        if n >= 3:
-            low_end = max(1, int(round(n * 0.33)))
-            high_start = min(n - 1, int(round(n * 0.67)))
-            off_vals = ordered[:low_end]
-            mid_vals = ordered[low_end:high_start]
-            peak_vals = ordered[high_start:]
-        else:
-            off_vals = ordered[:1]
-            mid_vals = ordered
-            peak_vals = ordered[-1:]
-
-    def avg(vals, fallback):
-        return sum(vals) / len(vals) if vals else fallback
-
-    band_avg = {
-        "경부하": avg(off_vals, base_avg_kw),
-        "중간부하": avg(mid_vals, base_avg_kw),
-        "최대부하": avg(peak_vals, max_kw),
-    }
-
-    return {
-        "base_avg_kw": round(base_avg_kw, 3),
-        "off_peak_kw": round(band_avg["경부하"], 3),
-        "mid_peak_kw": round(band_avg["중간부하"], 3),
-        "peak_kw": round(band_avg["최대부하"], 3),
-        "off_ratio": round(band_avg["경부하"] / base_avg_kw, 4),
-        "mid_ratio": round(band_avg["중간부하"] / base_avg_kw, 4),
-        "peak_ratio": round(band_avg["최대부하"] / base_avg_kw, 4),
-        "hourly_profile_kw": hourly_profile_kw,
-        "source": "actual_load_level",
-    }
-
-
 def summarize_band_loads_from_hourly(hourly_map, season):
     """
-    파워플래너 시간대별 사용량 값을 그대로 사용하되,
-    경/중/최대부하는 파워플래너 계절별 시간대 구분표 기준으로만 나눈다.
-    조회 당일 자료처럼 미래 시간이 0으로 채워진 경우가 많아서 계산용 평균부하/비율은 양수 데이터 기준으로 산출한다.
-    그래프 표시용 hourly_profile_kw는 원본 24시간 형태를 유지한다.
+    실제 시간대별 사용량을 우선 기준으로 경/중/최 평균부하와 비율을 계산한다.
+    가중치 고정값은 사용하지 않는다.
     """
     hourly_profile_kw = aggregate_hourly_profile_kw(hourly_map)
     if not hourly_profile_kw:
         return None
 
-    target_season = season if season in SEASON_SCHEDULE else month_to_season(datetime.now().month)
-    valid_items = {}
-    for h in range(24):
-        try:
-            kw = float(hourly_profile_kw.get(h, 0.0))
-        except Exception:
-            kw = 0.0
-        if kw > 0:
-            valid_items[h] = kw
-
-    if not valid_items:
+    positive_values = [v for v in hourly_profile_kw.values() if v > 0]
+    if not positive_values:
         return None
 
-    base_avg_kw = sum(valid_items.values()) / len(valid_items)
+    base_avg_kw = sum(positive_values) / len(positive_values)
     if base_avg_kw <= 0:
         return None
 
+    schedule = SEASON_SCHEDULE.get(season) or SEASON_SCHEDULE["봄·가을"]
     band_buckets = {"경부하": [], "중간부하": [], "최대부하": []}
-    band_energy = {"경부하": 0.0, "중간부하": 0.0, "최대부하": 0.0}
 
-    for hour, kw in sorted(valid_items.items()):
-        band = hour_to_label(hour, target_season)
+    for hour, kw in hourly_profile_kw.items():
+        band = hour_to_label(hour, season if season in SEASON_SCHEDULE else "봄·가을")
         band_buckets[band].append(kw)
-        band_energy[band] += kw
 
     band_avg = {}
     for label in ["경부하", "중간부하", "최대부하"]:
         vals = band_buckets[label]
-        band_avg[label] = (sum(vals) / len(vals)) if vals else 0.0
+        band_avg[label] = (sum(vals) / len(vals)) if vals else base_avg_kw
 
-    total_energy = sum(band_energy.values())
-    energy_ratio = {k: (band_energy[k] / total_energy if total_energy else 0.0) for k in band_energy}
+    off_ratio = band_avg["경부하"] / base_avg_kw if base_avg_kw else 1.0
+    mid_ratio = band_avg["중간부하"] / base_avg_kw if base_avg_kw else 1.0
+    peak_ratio = band_avg["최대부하"] / base_avg_kw if base_avg_kw else 1.0
 
     return {
         "base_avg_kw": round(base_avg_kw, 3),
         "off_peak_kw": round(band_avg["경부하"], 3),
         "mid_peak_kw": round(band_avg["중간부하"], 3),
         "peak_kw": round(band_avg["최대부하"], 3),
-        "off_ratio": round(band_avg["경부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
-        "mid_ratio": round(band_avg["중간부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
-        "peak_ratio": round(band_avg["최대부하"] / base_avg_kw, 4) if base_avg_kw else 0.0,
-        "energy_off_ratio": round(energy_ratio["경부하"], 4),
-        "energy_mid_ratio": round(energy_ratio["중간부하"], 4),
-        "energy_peak_ratio": round(energy_ratio["최대부하"], 4),
+        "off_ratio": round(off_ratio, 4),
+        "mid_ratio": round(mid_ratio, 4),
+        "peak_ratio": round(peak_ratio, 4),
         "hourly_profile_kw": hourly_profile_kw,
-        "valid_hour_count": len(valid_items),
-        "source": "powerplanner_tou_hourly_positive",
+        "source": "actual_hourly_usage",
     }
 
 def select_15min_view_if_available(driver, by, logs, label):
@@ -1129,14 +1049,14 @@ def select_15min_view_if_available(driver, by, logs, label):
         ]
         clicked = click_first(driver, radio_selectors, logs, f'{label} 15분 선택')
         if clicked:
-            time.sleep(0.25)
+            time.sleep(0.6)
             search_selectors = [
                 (by.XPATH, "//button[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
                 (by.XPATH, "//a[contains(normalize-space(.),'조회') or contains(normalize-space(.),'검색') ]"),
                 (by.CSS_SELECTOR, "button"),
             ]
             click_first(driver, search_selectors, logs, f'{label} 조회 버튼')
-            time.sleep(0.5)
+            time.sleep(1.2)
     except Exception as e:
         add_log(logs, f'{label} 15분 기준 설정 실패(무시): {e}')
 
@@ -1454,33 +1374,17 @@ def extract_max_demand_from_text(text):
     return max(values) if values else 0.0
 
 
-def fetch_and_parse_powerplanner_page(driver, wait, by, page_meta, result, logs):
-    page = visit_powerplanner_page(
-        driver=driver,
-        wait=wait,
-        by=by,
-        url=page_meta["url"],
-        logs=logs,
-        label=page_meta["label"],
-        ready_patterns=page_meta.get("ready"),
-        post_load=page_meta.get("post_load"),
-    )
-    parser = page_meta.get("parser")
-    if parser is not None:
-        parser(page, result, logs)
-
-
 def visit_powerplanner_page(driver, wait, by, url, logs, label, ready_patterns=None, post_load=None):
     driver.get(url)
     wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
     wait.until(lambda d: len(d.find_elements(by.TAG_NAME, "body")) > 0)
-    time.sleep(0.35)
+    time.sleep(1.2)
 
     if callable(post_load):
         try:
             post_load(driver, by, logs, label)
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-            time.sleep(0.3)
+            time.sleep(0.8)
         except Exception as e:
             add_log(logs, f"{label} 후처리 실패(무시): {e}")
 
@@ -1617,158 +1521,8 @@ def scrape_hourly_usage_page(page, result, logs):
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
 
-
-def flatten_columns_for_powerplanner(df):
-    work = df.copy().fillna(0)
-    try:
-        if isinstance(work.columns, pd.MultiIndex):
-            cols = []
-            for col in work.columns:
-                parts = [normalize_space(str(x)) for x in col if normalize_space(str(x)) and str(x).lower() != "nan"]
-                cols.append(" ".join(parts))
-            work.columns = cols
-        else:
-            work.columns = [normalize_space(c) for c in work.columns]
-    except Exception:
-        work.columns = [normalize_space(c) for c in work.columns]
-    return work
-
-
-def extract_daily_timeband_energy_summary(tables, season=None):
-    """
-    파워플래너 일별요금 표의 전력사용량(kWh) 경/중/최대부하 컬럼을 직접 합산한다.
-    시간대별 순간 패턴보다 파워플래너 요금표에 쓰이는 구간별 kWh가 우선이다.
-    """
-    target_season = season if season in SEASON_SCHEDULE else month_to_season(datetime.now().month)
-    schedule = SEASON_SCHEDULE[target_season]
-    band_hours = {label: max(len(hours), 1) for label, hours in schedule.items()}
-
-    best = None
-    for df in tables:
-        sig = table_signature(df)
-        if not ("전력사용량" in sig and "중간부하" in sig and "경부하" in sig and "최대부하" in sig):
-            continue
-
-        work = flatten_columns_for_powerplanner(df)
-        cols = list(work.columns)
-        usage_cols = {}
-
-        # MultiIndex가 제대로 유지된 경우: "전력사용량(kWh) 중간부하" 형태를 우선 사용
-        for band in ["경부하", "중간부하", "최대부하"]:
-            candidates = [c for c in cols if "전력사용량" in c and band in c]
-            if candidates:
-                usage_cols[band] = candidates[0]
-
-        # read_html이 헤더를 단순화해서 "중간부하/최대부하/경부하"가 반복된 경우 위치 기반 보정
-        if len(usage_cols) < 3:
-            band_only = [i for i, c in enumerate(cols) if any(b in c for b in ["경부하", "중간부하", "최대부하"])]
-            # 일별요금 표는 보통 [최대수요, 전력사용량 3개, 전력량요금 4개] 순서다.
-            # 첫 번째로 등장하는 경/중/최대부하 묶음을 전력사용량(kWh)로 본다.
-            first_group = []
-            for i in band_only:
-                c = cols[i]
-                if any(b in c for b in ["경부하", "중간부하", "최대부하"]):
-                    first_group.append((i, c))
-                if len(first_group) >= 3:
-                    break
-            for i, c in first_group:
-                for band in ["경부하", "중간부하", "최대부하"]:
-                    if band in c and band not in usage_cols:
-                        usage_cols[band] = c
-
-        if len(usage_cols) < 3:
-            continue
-
-        date_col = None
-        for c in cols:
-            if "일자" in c or normalize_key(c) in ["일", "날짜"]:
-                date_col = c
-                break
-
-        totals = {"경부하": 0.0, "중간부하": 0.0, "최대부하": 0.0}
-        valid_days = 0
-        rows_used = 0
-
-        for _, row in work.iterrows():
-            if date_col:
-                date_text = normalize_space(row.get(date_col, ""))
-                # 04.24처럼 조회 당일 이후 0행도 있으므로 총합 0인 행은 제외한다.
-                if date_text and not re.search(r"\d", date_text):
-                    continue
-
-            vals = {band: parse_number(row.get(col, 0)) for band, col in usage_cols.items()}
-            row_total = sum(vals.values())
-            if row_total <= 0:
-                continue
-
-            for band in totals:
-                totals[band] += vals[band]
-            valid_days += 1
-            rows_used += 1
-
-        if rows_used <= 0 or sum(totals.values()) <= 0:
-            continue
-
-        # 일별요금 월 조회 표이므로 유효 일수로 나눠 1일 평균 kWh → 시간대별 평균 kW로 변환
-        band_avg_kw = {}
-        for band in ["경부하", "중간부하", "최대부하"]:
-            daily_kwh = totals[band] / valid_days
-            band_avg_kw[band] = daily_kwh / band_hours[band]
-
-        base_avg_kw = (sum(totals.values()) / valid_days) / 24.0
-        if base_avg_kw <= 0:
-            continue
-
-        summary = {
-            "base_avg_kw": round(base_avg_kw, 3),
-            "off_peak_kw": round(band_avg_kw["경부하"], 3),
-            "mid_peak_kw": round(band_avg_kw["중간부하"], 3),
-            "peak_kw": round(band_avg_kw["최대부하"], 3),
-            "off_ratio": round(band_avg_kw["경부하"] / base_avg_kw, 4),
-            "mid_ratio": round(band_avg_kw["중간부하"] / base_avg_kw, 4),
-            "peak_ratio": round(band_avg_kw["최대부하"] / base_avg_kw, 4),
-            "daily_band_kwh": {band: round(totals[band] / valid_days, 3) for band in totals},
-            "monthly_band_kwh": {band: round(totals[band], 3) for band in totals},
-            "valid_days": valid_days,
-            "source": "powerplanner_daily_bill_timeband",
-        }
-        if best is None or valid_days > best.get("valid_days", 0):
-            best = summary
-
-    return best
-
-
 def scrape_daily_usage_page(page, result, logs):
     tables = safe_read_html_tables(page["html"], logs=logs, label="일별 사용량")
-
-    # 파워플래너 일별요금 표의 경/중/최대부하 kWh를 최우선으로 반영한다.
-    # 이 값은 파워플래너 요금계산에 직접 쓰이는 시간대 구분값이므로, CVR 계산에서도 가장 신뢰도가 높다.
-    daily_band_summary = extract_daily_timeband_energy_summary(tables, season=month_to_season(datetime.now().month))
-    if daily_band_summary:
-        # 정확도 우선: 파워플래너 요금표에 실제로 쓰이는 일별요금 경/중/최대 kWh를 항상 최우선 반영한다.
-        # 시간대별 그래프는 화면 표시용 보조자료로만 두고, CVR 계산 기준은 이 값으로 고정한다.
-        result["auto_avg_base_kw"] = daily_band_summary["base_avg_kw"]
-        result["auto_off_peak_kw"] = daily_band_summary["off_peak_kw"]
-        result["auto_mid_peak_kw"] = daily_band_summary["mid_peak_kw"]
-        result["auto_peak_kw"] = daily_band_summary["peak_kw"]
-        result["auto_off_ratio"] = daily_band_summary["off_ratio"]
-        result["auto_mid_ratio"] = daily_band_summary["mid_ratio"]
-        result["auto_peak_ratio"] = daily_band_summary["peak_ratio"]
-        result["daily_band_kwh"] = daily_band_summary.get("daily_band_kwh", {})
-        result["monthly_band_kwh"] = daily_band_summary.get("monthly_band_kwh", {})
-        result["auto_source"] = "daily_bill_timeband"
-        result["hourly_profile_kw"] = {}
-        add_log(
-            logs,
-            f"정확도 우선 적용: 일별요금 경/중/최대 kWh 기준으로 평균부하를 최종 반영: "
-            f"평균 {daily_band_summary['base_avg_kw']:,.1f} kW / "
-            f"경 {daily_band_summary['off_peak_kw']:,.1f} / "
-            f"중 {daily_band_summary['mid_peak_kw']:,.1f} / "
-            f"최대 {daily_band_summary['peak_kw']:,.1f} kW "
-            f"({daily_band_summary['valid_days']}일 기준)"
-        )
-
-
     md = max(extract_max_demand_from_tables(tables), extract_max_demand_from_text(page["text"]))
     if md > 0:
         result["max_demand_kw"] = max(result["max_demand_kw"], md)
@@ -1911,7 +1665,7 @@ def scrape_kepco_power_planner(user_id, user_pw):
         add_log(logs, "chromedriver version: {0}".format(env_info["chromedriver_version"]))
 
         driver = build_chrome_driver(logs)
-        wait = WebDriverWait(driver, 15)
+        wait = WebDriverWait(driver, 30)
 
         login_url = "https://pp.kepco.co.kr/intro.do"
         driver.get(login_url)
@@ -1954,7 +1708,7 @@ def scrape_kepco_power_planner(user_id, user_pw):
             return {"status": "error", "message": "로그인 버튼 selector를 찾지 못했습니다.", "logs": "\n".join(logs)}
 
         wait.until(lambda d: "Logout" in d.page_source or "스마트뷰" in d.page_source or "고객정보" in d.page_source)
-        time.sleep(0.8)
+        time.sleep(2)
         add_log(logs, "로그인 성공 및 메인 진입 확인")
 
         result = {
@@ -1980,26 +1734,20 @@ def scrape_kepco_power_planner(user_id, user_pw):
             "auto_mid_ratio": 0.0,
             "auto_peak_ratio": 0.0,
             "hourly_profile_kw": {},
-            "daily_band_kwh": {},
-            "monthly_band_kwh": {},
             "auto_source": "",
         }
 
-        # 속도 최적화 핵심:
-        # 1) 필수 화면만 먼저 접속
-        # 2) 값이 부족할 때만 보조 화면을 추가 접속
-        # 기존처럼 모든 화면을 무조건 순회하면 사업장/서버 상태에 따라 1~2분까지 늘어날 수 있음
-        essential_pages = [
+        pages_to_visit = [
             {
                 "label": "스마트뷰",
                 "url": "https://pp.kepco.co.kr/rm/rm0101.do?menu_id=O010101",
-                "ready": ["스마트뷰"],
+                "ready": ["스마트뷰", "실시간사용량"],
                 "parser": scrape_smartview_page,
             },
             {
                 "label": "고객정보",
                 "url": "https://pp.kepco.co.kr/mb/mb0101.do?menu_id=O010601",
-                "ready": ["고객정보"],
+                "ready": ["고객정보", "계약종별"],
                 "parser": scrape_customer_info_page,
             },
             {
@@ -2010,10 +1758,47 @@ def scrape_kepco_power_planner(user_id, user_pw):
                 "parser": scrape_hourly_usage_page,
             },
             {
+                "label": "시간대별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
+                "ready": ["시간대별", "패턴기간"],
+                "post_load": select_15min_view_if_available,
+                "parser": scrape_pattern_hourly_page,
+            },
+            {
+                "label": "일별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0102.do?menu_id=O010202",
+                "ready": ["일별", "사용량"],
+                "parser": scrape_daily_usage_page,
+            },
+            {
                 "label": "월별 사용량",
                 "url": "https://pp.kepco.co.kr/rs/rs0103.do?menu_id=O010203",
                 "ready": ["월별", "사용량"],
                 "parser": scrape_monthly_usage_page,
+            },
+            {
+                "label": "연도별 사용량",
+                "url": "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204",
+                "ready": ["연도별", "사용량"],
+                "parser": scrape_yearly_usage_page,
+            },
+            {
+                "label": "요일별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0102.do?menu_id=O010302",
+                "ready": ["요일별", "패턴기간"],
+                "parser": None,
+            },
+            {
+                "label": "월별 패턴",
+                "url": "https://pp.kepco.co.kr/rp/rp0103.do?menu_id=O010303",
+                "ready": ["월별", "패턴기간"],
+                "parser": None,
+            },
+            {
+                "label": "실시간·예상요금",
+                "url": "https://pp.kepco.co.kr/pr/pr0101.do?menu_id=O010401",
+                "ready": ["실시간", "예상"],
+                "parser": scrape_realtime_charge_page,
             },
             {
                 "label": "시간대별요금",
@@ -2023,56 +1808,21 @@ def scrape_kepco_power_planner(user_id, user_pw):
             },
         ]
 
-        fallback_pages = [
-            {
-                "label": "시간대별 패턴",
-                "url": "https://pp.kepco.co.kr/rp/rp0101.do?menu_id=O010301",
-                "ready": ["시간대별", "패턴기간"],
-                "post_load": select_15min_view_if_available,
-                "parser": scrape_pattern_hourly_page,
-                "need": lambda r: r.get("auto_avg_base_kw", 0.0) <= 0,
-            },
-            {
-                "label": "연도별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0104.do?menu_id=O010204",
-                "ready": ["연도별", "사용량"],
-                "parser": scrape_yearly_usage_page,
-                "need": lambda r: r.get("annual_usage_kwh", 0.0) <= 0,
-            },
-            {
-                "label": "일별 사용량",
-                "url": "https://pp.kepco.co.kr/rs/rs0102.do?menu_id=O010202",
-                "ready": ["일별", "사용량"],
-                "parser": scrape_daily_usage_page,
-                "need": lambda r: r.get("max_demand_kw", 0.0) <= 0,
-            },
-            {
-                "label": "실시간·예상요금",
-                "url": "https://pp.kepco.co.kr/pr/pr0101.do?menu_id=O010401",
-                "ready": ["실시간", "예상"],
-                "parser": scrape_realtime_charge_page,
-                "need": lambda r: (
-                    r.get("off_peak_rate", 0.0) <= 0
-                    or r.get("mid_peak_rate", 0.0) <= 0
-                    or r.get("peak_rate", 0.0) <= 0
-                    or r.get("basic_charge_unit", 0.0) <= 0
-                ),
-            },
-        ]
-
-        for page_meta in essential_pages:
+        for page_meta in pages_to_visit:
             try:
-                fetch_and_parse_powerplanner_page(driver, wait, By, page_meta, result, logs)
-            except Exception as page_error:
-                add_log(logs, f"{page_meta['label']} 처리 실패: {page_error}")
-                add_log(logs, traceback.format_exc())
-
-        for page_meta in fallback_pages:
-            try:
-                if not page_meta.get("need", lambda r: True)(result):
-                    add_log(logs, f"{page_meta['label']} 생략: 이미 필요한 값 확보")
-                    continue
-                fetch_and_parse_powerplanner_page(driver, wait, By, page_meta, result, logs)
+                page = visit_powerplanner_page(
+                    driver=driver,
+                    wait=wait,
+                    by=By,
+                    url=page_meta["url"],
+                    logs=logs,
+                    label=page_meta["label"],
+                    ready_patterns=page_meta.get("ready"),
+                    post_load=page_meta.get("post_load"),
+                )
+                parser = page_meta.get("parser")
+                if parser is not None:
+                    parser(page, result, logs)
             except Exception as page_error:
                 add_log(logs, f"{page_meta['label']} 처리 실패: {page_error}")
                 add_log(logs, traceback.format_exc())
@@ -2733,9 +2483,6 @@ with left:
                             st.session_state["pp_auto_mid_ratio"] = result.get("auto_mid_ratio", 0.0)
                             st.session_state["pp_auto_peak_ratio"] = result.get("auto_peak_ratio", 0.0)
                             st.session_state["pp_hourly_profile_kw"] = result.get("hourly_profile_kw", {})
-                            st.session_state["pp_daily_band_kwh"] = result.get("daily_band_kwh", {})
-                            st.session_state["pp_monthly_band_kwh"] = result.get("monthly_band_kwh", {})
-                            st.session_state["pp_auto_source"] = result.get("auto_source", "")
                             st.success(result["message"])
                         else:
                             st.error(result["message"])
@@ -2980,7 +2727,7 @@ with left:
         ratio_color = "auto" if auto_ratio_ready else "verify"
 
         if auto_ratio_ready:
-            st.caption("파워플래너 일별요금 경/중/최대 kWh를 우선 기준으로 자동 산출되며, 필요 시 직접 수정할 수 있습니다.")
+            st.caption("파워플래너 시간대 평균부하를 기준으로 자동 산출되며, 필요 시 직접 수정할 수 있습니다.")
             default_avg_kw = st.session_state.get("pp_auto_avg_base_kw", 0.0)
             default_off_ratio = st.session_state.get("pp_auto_off_ratio", 1.0)
             default_mid_ratio = st.session_state.get("pp_auto_mid_ratio", 1.0)
@@ -3005,33 +2752,30 @@ with left:
         r1, r2, r3 = st.columns(3)
         with r1:
             off_ratio = colored_input(
-                "경부하 부하계수",
+                "경부하 비율",
                 st.number_input,
                 ratio_color,
-                min_value=0.0,
-                value=max(float(default_off_ratio or 0.0), 0.0),
+                min_value=0.10,
+                value=float(default_off_ratio or 1.0),
                 step=0.01,
-                format="%.2f",
             )
         with r2:
             mid_ratio = colored_input(
-                "중간부하 부하계수",
+                "중간부하 비율",
                 st.number_input,
                 ratio_color,
-                min_value=0.0,
-                value=max(float(default_mid_ratio or 0.0), 0.0),
+                min_value=0.10,
+                value=float(default_mid_ratio or 1.0),
                 step=0.01,
-                format="%.2f",
             )
         with r3:
             peak_ratio = colored_input(
-                "최대부하 부하계수",
+                "최대부하 비율",
                 st.number_input,
                 ratio_color,
-                min_value=0.0,
-                value=max(float(default_peak_ratio or 0.0), 0.0),
+                min_value=0.10,
+                value=float(default_peak_ratio or 1.0),
                 step=0.01,
-                format="%.2f",
             )
 
         auto_loads = avg_kw_to_timeband_loads(avg_base_kw, off_ratio, mid_ratio, peak_ratio)
@@ -3087,9 +2831,11 @@ active_days_per_year = get_active_days_per_year(
     include_holidays_as_shutdown=holiday_reflect,
 )
 
-# =========================================================
-# 파워플래너 시간대별 값 우선 계산 엔진
-# =========================================================
+loads_by_label = {
+    "경부하": off_peak_kw,
+    "중간부하": mid_peak_kw,
+    "최대부하": peak_kw,
+}
 if (
     st.session_state["pp_loaded"]
     and st.session_state["pp_off_peak_rate"] > 0
@@ -3107,99 +2853,55 @@ else:
     rate_table = safe_rate_table(primary_voltage_class)
 tariff_voltage_class = primary_voltage_class
 
-pp_profile_raw = st.session_state.get("pp_hourly_profile_kw", {})
-use_pp_hourly_engine = (
-    st.session_state.get("pp_loaded", False)
-    and input_mode == "파워플래너 자동 산출"
-    and st.session_state.get("pp_auto_source", "") != "daily_bill_timeband"
-    and isinstance(pp_profile_raw, dict)
-    and len(pp_profile_raw) >= 6
-)
-
-if use_pp_hourly_engine:
-    kw_by_hour_for_calc = {}
-    for h in range(24):
-        try:
-            val = float(pp_profile_raw.get(h, pp_profile_raw.get(str(h), 0.0)))
-        except Exception:
-            val = 0.0
-        kw_by_hour_for_calc[h] = max(val, 0.0)
-else:
-    loads_by_label = {
-        "경부하": off_peak_kw,
-        "중간부하": mid_peak_kw,
-        "최대부하": peak_kw,
-    }
-    kw_by_hour_for_calc = {
-        h: (loads_by_label[hour_to_label(h, season)] if h in active_hours else 0.0)
-        for h in range(24)
-    }
-
-if use_pp_hourly_engine:
-    band_values_positive = {"경부하": [], "중간부하": [], "최대부하": []}
-    band_energy_positive = {"경부하": 0.0, "중간부하": 0.0, "최대부하": 0.0}
-    positive_values = []
-    for h, kw in kw_by_hour_for_calc.items():
-        if h not in active_hours or kw <= 0:
-            continue
-        band = hour_to_label(h, season)
-        band_values_positive[band].append(kw)
-        band_energy_positive[band] += kw
-        positive_values.append(kw)
-
-    base_avg_for_ratio = (sum(positive_values) / len(positive_values)) if positive_values else 0.0
-    loads_by_label = {}
-    for label in ["경부하", "중간부하", "최대부하"]:
-        vals = band_values_positive[label]
-        loads_by_label[label] = (sum(vals) / len(vals)) if vals else 0.0
-
-    if base_avg_for_ratio > 0:
-        avg_base_kw = base_avg_for_ratio
-        off_peak_kw = loads_by_label["경부하"]
-        mid_peak_kw = loads_by_label["중간부하"]
-        peak_kw = loads_by_label["최대부하"]
-        off_ratio = off_peak_kw / avg_base_kw
-        mid_ratio = mid_peak_kw / avg_base_kw
-        peak_ratio = peak_kw / avg_base_kw
-
-    total_positive_energy = sum(band_energy_positive.values())
-    energy_share_by_label = {
-        label: (band_energy_positive[label] / total_positive_energy if total_positive_energy else 0.0)
-        for label in ["경부하", "중간부하", "최대부하"]
-    }
-else:
-    loads_by_label = {
-        "경부하": off_peak_kw,
-        "중간부하": mid_peak_kw,
-        "최대부하": peak_kw,
-    }
-    daily_energy_for_share = {
-        label: loads_by_label[label] * operating_hour_count[label]
-        for label in ["경부하", "중간부하", "최대부하"]
-    }
-    total_energy_for_share = sum(daily_energy_for_share.values())
-    energy_share_by_label = {
-        label: (daily_energy_for_share[label] / total_energy_for_share if total_energy_for_share else 0.0)
-        for label in ["경부하", "중간부하", "최대부하"]
-    }
-
-hour_rows = []
+rows = []
 daily_base_kwh = 0.0
 daily_saved_kwh = 0.0
 daily_cost_saving = 0.0
-band_calc = {
-    label: {"hours": 0, "base_kwh": 0.0, "saved_kwh": 0.0, "cost": 0.0, "kw_sum": 0.0, "kw_count": 0}
-    for label in ["경부하", "중간부하", "최대부하"]
-}
 
+for label in ["경부하", "중간부하", "최대부하"]:
+    hours = operating_hour_count[label]
+    load_kw = loads_by_label[label]
+    rate = rate_table[season][label]
+
+    saving_rate_pct, saved_kw, saved_kwh = calc_average_result(
+        load_kw, voltage_drop_pct, defaults["cvrf"], z, i, p, hours
+    )
+    base_kwh = load_kw * hours
+    cost_save = saved_kwh * rate
+
+    rows.append({
+        "구분": label,
+        "운영시간(h/day)": hours,
+        "평균부하(kW)": round(load_kw, 2),
+        "사용전력량(kWh/day)": round(base_kwh, 2),
+        "절감률(%)": round(saving_rate_pct, 3),
+        "절감전력(kW)": round(saved_kw, 2),
+        "절감전력량(kWh/day)": round(saved_kwh, 2),
+        "적용단가(원/kWh)": round(rate, 1),
+        "절감요금(원/day)": round(cost_save, 1),
+    })
+
+    daily_base_kwh += base_kwh
+    daily_saved_kwh += saved_kwh
+    daily_cost_saving += cost_save
+
+period_df = pd.DataFrame(rows)
+
+saving_rate_total = (daily_saved_kwh / daily_base_kwh * 100.0) if daily_base_kwh else 0.0
+day_operation_hours = sum(operating_hour_count.values())
+avg_saved_kw = (daily_saved_kwh / day_operation_hours) if day_operation_hours else 0.0
+monthly_saved_kwh = daily_saved_kwh * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
+yearly_saved_kwh = daily_saved_kwh * active_days_per_year
+monthly_cost_saving = daily_cost_saving * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
+yearly_cost_saving = daily_cost_saving * active_days_per_year
+
+hour_rows = []
 for h in range(24):
     label = hour_to_label(h, season)
     operating = h in active_hours
-    kw = kw_by_hour_for_calc.get(h, 0.0) if operating else 0.0
+    kw = loads_by_label[label] if operating else 0.0
     rate = rate_table[season][label]
     saving_rate_pct, saved_kw, saved_kwh = calc_average_result(kw, voltage_drop_pct, defaults["cvrf"], z, i, p, 1.0)
-    cost_save = saved_kwh * rate
-
     hour_rows.append({
         "시간": "{0:02d}:00".format(h),
         "시간번호": h,
@@ -3210,65 +2912,19 @@ for h in range(24):
         "절감전력(kW)": round(saved_kw, 3),
         "절감전력량(kWh)": round(saved_kwh, 3),
         "요금단가(원/kWh)": round(rate, 1),
-        "절감요금(원)": round(cost_save, 1),
+        "절감요금(원)": round(saved_kwh * rate, 1),
     })
-
-    include_for_summary = operating and (kw > 0 if use_pp_hourly_engine else True)
-    if include_for_summary:
-        band_calc[label]["hours"] += 1
-        band_calc[label]["base_kwh"] += kw
-        band_calc[label]["saved_kwh"] += saved_kwh
-        band_calc[label]["cost"] += cost_save
-        band_calc[label]["kw_sum"] += kw
-        band_calc[label]["kw_count"] += 1
-        daily_base_kwh += kw
-        daily_saved_kwh += saved_kwh
-        daily_cost_saving += cost_save
 
 hourly_df = pd.DataFrame(hour_rows)
 
-rows = []
-for label in ["경부하", "중간부하", "최대부하"]:
-    summary_hours = band_calc[label]["hours"]
-    avg_kw_label = (
-        band_calc[label]["kw_sum"] / band_calc[label]["kw_count"]
-        if band_calc[label]["kw_count"] > 0
-        else loads_by_label.get(label, 0.0)
-    )
-    base_kwh = band_calc[label]["base_kwh"]
-    saved_kwh = band_calc[label]["saved_kwh"]
-    cost_save = band_calc[label]["cost"]
-    saving_rate_pct = (saved_kwh / base_kwh * 100.0) if base_kwh else 0.0
-    saved_kw = (saved_kwh / summary_hours) if summary_hours else 0.0
-
-    rows.append({
-        "구분": label,
-        "운영시간(h/day)": summary_hours,
-        "평균부하(kW)": round(avg_kw_label, 2),
-        "사용전력량(kWh/day)": round(base_kwh, 2),
-        "절감률(%)": round(saving_rate_pct, 3),
-        "절감전력(kW)": round(saved_kw, 2),
-        "절감전력량(kWh/day)": round(saved_kwh, 2),
-        "적용단가(원/kWh)": round(rate_table[season][label], 1),
-        "절감요금(원/day)": round(cost_save, 1),
-        "kWh비중(%)": round(energy_share_by_label.get(label, 0.0) * 100.0, 2),
-    })
-
-period_df = pd.DataFrame(rows)
-
-saving_rate_total = (daily_saved_kwh / daily_base_kwh * 100.0) if daily_base_kwh else 0.0
-day_operation_hours = sum(band_calc[label]["hours"] for label in ["경부하", "중간부하", "최대부하"])
-avg_saved_kw = (daily_saved_kwh / day_operation_hours) if day_operation_hours else 0.0
-monthly_saved_kwh = daily_saved_kwh * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
-yearly_saved_kwh = daily_saved_kwh * active_days_per_year
-monthly_cost_saving = daily_cost_saving * (active_days_per_year / 12.0 if active_days_per_year else 0.0)
-yearly_cost_saving = daily_cost_saving * active_days_per_year
-
+# 탭별 비교표
 max_compare_drop_pct = 7.5
 tap_compare_rows = []
 current_tap_int = int(current_tap)
+
+# 현재 탭(기준점)도 함께 표시
 base_compare_voltage = current_voltage_for_calc
-tap_compare_rows.append({
+base_compare_row = {
     "탭": current_tap_int,
     "계산 기준 전압(V)": round(base_compare_voltage, 1),
     "전압 저감률(%)": 0.0,
@@ -3278,7 +2934,8 @@ tap_compare_rows.append({
     "연 절감량(kWh)": 0.0,
     "일 절감요금(원)": 0.0,
     "연 절감요금(원)": 0.0,
-})
+}
+tap_compare_rows.append(base_compare_row)
 
 for tap in range(max(current_tap_int - 1, 1), 0, -1):
     delta_steps = max(current_tap_int - int(tap), 0)
@@ -3286,27 +2943,28 @@ for tap in range(max(current_tap_int - 1, 1), 0, -1):
     if tap_voltage_drop_pct < 1.25 or tap_voltage_drop_pct > max_compare_drop_pct:
         continue
     tap_new_voltage = current_voltage_for_calc * (1 - tap_voltage_drop_pct / 100.0)
+
     tap_daily_saved_kwh = 0.0
     tap_daily_cost = 0.0
-    tap_base_kwh = 0.0
-    tap_hours = 0
 
-    for h in range(24):
-        if h not in active_hours:
-            continue
-        kw = kw_by_hour_for_calc.get(h, 0.0)
-        if use_pp_hourly_engine and kw <= 0:
-            continue
-        label = hour_to_label(h, season)
+    for label in ["경부하", "중간부하", "최대부하"]:
+        hours = operating_hour_count[label]
+        load_kw = loads_by_label[label]
         rate = rate_table[season][label]
-        _, _, tap_saved_kwh = calc_average_result(kw, tap_voltage_drop_pct, defaults["cvrf"], z, i, p, 1.0)
+        tap_saving_rate_pct, tap_saved_kw, tap_saved_kwh = calc_average_result(
+            load_kw,
+            tap_voltage_drop_pct,
+            defaults["cvrf"],
+            z,
+            i,
+            p,
+            hours
+        )
         tap_daily_saved_kwh += tap_saved_kwh
         tap_daily_cost += tap_saved_kwh * rate
-        tap_base_kwh += kw
-        tap_hours += 1
 
-    tap_avg_saved_kw = (tap_daily_saved_kwh / tap_hours) if tap_hours else 0.0
-    tap_saving_rate_total = (tap_daily_saved_kwh / tap_base_kwh * 100.0) if tap_base_kwh else 0.0
+    tap_avg_saved_kw = (tap_daily_saved_kwh / day_operation_hours) if day_operation_hours else 0.0
+    tap_saving_rate_total = (tap_daily_saved_kwh / daily_base_kwh * 100.0) if daily_base_kwh else 0.0
     tap_yearly_saved_kwh = tap_daily_saved_kwh * active_days_per_year
     tap_yearly_cost = tap_daily_cost * active_days_per_year
 
@@ -3327,10 +2985,16 @@ if not tap_compare_df.empty:
     tap_compare_df = tap_compare_df[
         (tap_compare_df["탭"] == current_tap_int) |
         (tap_compare_df["전압 저감률(%)"] == 0.0) |
-        ((tap_compare_df["전압 저감률(%)"] >= 1.25) & (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct))
+        (
+            (tap_compare_df["전압 저감률(%)"] >= 1.25) &
+            (tap_compare_df["전압 저감률(%)"] <= max_compare_drop_pct)
+        )
     ].copy()
     tap_compare_df = tap_compare_df.drop_duplicates(subset=["탭"], keep="first")
-    tap_compare_df = tap_compare_df.sort_values(by=["탭"], ascending=[False]).reset_index(drop=True)
+    tap_compare_df = tap_compare_df.sort_values(
+        by=["탭"],
+        ascending=[False]
+    ).reset_index(drop=True)
 
 # 요약 데이터프레임
 rate_summary_df = pd.DataFrame({
@@ -3429,21 +3093,11 @@ with right:
                 st.session_state.get("pp_auto_mid_peak_kw", 0.0),
                 st.session_state.get("pp_auto_peak_kw", 0.0),
             ))
-            st.write("- 자동 산출 경/중/최 부하계수: **{0:.2f} / {1:.2f} / {2:.2f}**".format(
+            st.write("- 자동 산출 경/중/최 비율: **{0:.2f} / {1:.2f} / {2:.2f}**".format(
                 st.session_state.get("pp_auto_off_ratio", 0.0),
                 st.session_state.get("pp_auto_mid_ratio", 0.0),
                 st.session_state.get("pp_auto_peak_ratio", 0.0),
             ))
-            if st.session_state.get("pp_auto_source", "") == "daily_bill_timeband":
-                st.write("- 계산 기준: **파워플래너 일별요금 경/중/최대 kWh 우선**")
-                monthly_band = st.session_state.get("pp_monthly_band_kwh", {}) or {}
-                total_band = sum(float(v) for v in monthly_band.values()) if isinstance(monthly_band, dict) else 0.0
-                if total_band > 0:
-                    st.write("- 월 경/중/최 kWh 비중: **{0:.2f}% / {1:.2f}% / {2:.2f}%**".format(
-                        float(monthly_band.get("경부하", 0.0)) / total_band * 100.0,
-                        float(monthly_band.get("중간부하", 0.0)) / total_band * 100.0,
-                        float(monthly_band.get("최대부하", 0.0)) / total_band * 100.0,
-                    ))
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -3502,29 +3156,8 @@ with g2:
             y=tap_chart_df["평균 절감전력(kW)"].tolist(),
             text=[f"{v:.3f}" if float(v) != 0 else "0" for v in tap_chart_df["평균 절감전력(kW)"].tolist()],
             textposition="outside",
-            customdata=tap_chart_df[[
-                "계산 기준 전압(V)",
-                "전압 저감률(%)",
-                "절감률(%)",
-                "일 절감량(kWh)",
-                "연 절감량(kWh)",
-                "일 절감요금(원)",
-                "연 절감요금(원)",
-            ]].values,
-            hovertemplate=(
-                "탭=%{x}<br>"
-                "평균 절감전력=%{y:,.3f} kW<br>"
-                "계산 기준 전압=%{customdata[0]:,.1f} V<br>"
-                "전압 저감률=%{customdata[1]:.2f}%<br>"
-                "절감률=%{customdata[2]:.3f}%<br>"
-                "일 절감량=%{customdata[3]:,.3f} kWh<br>"
-                "연 절감량=%{customdata[4]:,.1f} kWh<br>"
-                "일 절감요금=%{customdata[5]:,.0f} 원<br>"
-                "연 절감요금=%{customdata[6]:,.0f} 원"
-                "<extra></extra>"
-            ),
         )
-        fig_bar.update_layout(title="탭별 예상 절감전력 비교", hovermode="closest")
+        fig_bar.update_layout(title="탭별 예상 절감전력 비교")
         fig_bar.update_xaxes(
             title_text="탭",
             autorange="reversed",
@@ -3569,8 +3202,62 @@ excel_output.seek(0)
 pdf_error = None
 pdf_bytes = None
 
-# PDF는 생성 시간이 길기 때문에 화면 재계산 때마다 만들지 않고,
-# 아래 PDF 저장 버튼을 누른 경우에만 생성한다.
+try:
+    pdf_font_info = get_korean_font_info()
+    fig_line_buf = create_matplotlib_line_chart(graph_df, font_info=pdf_font_info)
+    fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, font_info=pdf_font_info)
+
+    pdf_bytes = build_pdf_bytes_report(
+        site_name=site_name,
+        season=season,
+        created_at_text=created_at_text,
+        calc_voltage_basis=calc_voltage_basis,
+        primary_voltage_kv=primary_voltage_kv,
+        secondary_voltage_v=secondary_voltage_v,
+        new_voltage=new_voltage,
+        current_voltage_for_calc=current_voltage_for_calc,
+        voltage_drop_pct=voltage_drop_pct,
+        voltage_drop_v=voltage_drop_v,
+        primary_voltage_class=primary_voltage_class,
+        tariff_voltage_class=tariff_voltage_class,
+        contract_kind=contract_kind_display,
+        tariff_choice_desc=tariff_choice_desc,
+        cvrf_value=defaults["cvrf"],
+        z=z,
+        i=i,
+        p=p,
+        correction_factor=correction_factor,
+        reliability_text=reliability_text,
+        current_tap=current_tap,
+        target_tap=target_tap,
+        tap_step_percent=tap_step_percent,
+        avg_saved_kw=avg_saved_kw,
+        saving_rate_total=saving_rate_total,
+        daily_saved_kwh=daily_saved_kwh,
+        monthly_saved_kwh=monthly_saved_kwh,
+        yearly_saved_kwh=yearly_saved_kwh,
+        daily_cost_saving=daily_cost_saving,
+        monthly_cost_saving=monthly_cost_saving,
+        yearly_cost_saving=yearly_cost_saving,
+        operation_mode=operation_mode,
+        operating_start=operating_start,
+        operating_end=operating_end,
+        day_operation_hours=day_operation_hours,
+        active_days_per_year=active_days_per_year,
+        holiday_reflect=holiday_reflect,
+        holiday_count=holiday_count,
+        load_unit=load_unit,
+        load_summary_df=load_summary_df,
+        period_df=period_df,
+        hourly_pdf_df=hourly_df,
+        rate_summary_df=rate_summary_df,
+        season_time_band_df=season_time_band_df,
+        tap_compare_df=tap_compare_df,
+        fig_line_buf=fig_line_buf,
+        fig_bar_buf=fig_bar_buf,
+    )
+except Exception as e:
+    pdf_error = str(e)
 
 col_excel, col_pdf = st.columns(2)
 
@@ -3583,66 +3270,13 @@ with col_excel:
     )
 
 with col_pdf:
-    if st.button("📄 PDF 생성"):
-        try:
-            pdf_font_info = get_korean_font_info()
-            fig_line_buf = create_matplotlib_line_chart(graph_df, font_info=pdf_font_info)
-            fig_bar_buf = create_matplotlib_bar_chart(tap_compare_df, font_info=pdf_font_info)
-
-            pdf_bytes = build_pdf_bytes_report(
-                site_name=site_name,
-                season=season,
-                created_at_text=created_at_text,
-                calc_voltage_basis=calc_voltage_basis,
-                primary_voltage_kv=primary_voltage_kv,
-                secondary_voltage_v=secondary_voltage_v,
-                new_voltage=new_voltage,
-                current_voltage_for_calc=current_voltage_for_calc,
-                voltage_drop_pct=voltage_drop_pct,
-                voltage_drop_v=voltage_drop_v,
-                primary_voltage_class=primary_voltage_class,
-                tariff_voltage_class=tariff_voltage_class,
-                contract_kind=contract_kind_display,
-                tariff_choice_desc=tariff_choice_desc,
-                cvrf_value=defaults["cvrf"],
-                z=z,
-                i=i,
-                p=p,
-                correction_factor=correction_factor,
-                reliability_text=reliability_text,
-                current_tap=current_tap,
-                target_tap=target_tap,
-                tap_step_percent=tap_step_percent,
-                avg_saved_kw=avg_saved_kw,
-                saving_rate_total=saving_rate_total,
-                daily_saved_kwh=daily_saved_kwh,
-                monthly_saved_kwh=monthly_saved_kwh,
-                yearly_saved_kwh=yearly_saved_kwh,
-                daily_cost_saving=daily_cost_saving,
-                monthly_cost_saving=monthly_cost_saving,
-                yearly_cost_saving=yearly_cost_saving,
-                operation_mode=operation_mode,
-                operating_start=operating_start,
-                operating_end=operating_end,
-                day_operation_hours=day_operation_hours,
-                active_days_per_year=active_days_per_year,
-                holiday_reflect=holiday_reflect,
-                holiday_count=holiday_count,
-                load_unit=load_unit,
-                load_summary_df=load_summary_df,
-                period_df=period_df,
-                hourly_pdf_df=hourly_df,
-                rate_summary_df=rate_summary_df,
-                season_time_band_df=season_time_band_df,
-                tap_compare_df=tap_compare_df,
-                fig_line_buf=fig_line_buf,
-                fig_bar_buf=fig_bar_buf,
-            )
-            st.download_button(
-                "📄 PDF 다운로드",
-                data=pdf_bytes,
-                file_name="CVR보고서_{0}_{1}.pdf".format(site_name, datetime.now().strftime("%Y%m%d_%H%M%S")),
-                mime="application/pdf",
-            )
-        except Exception as e:
-            st.error("PDF 생성 실패: {0}".format(str(e)))
+    if pdf_bytes is not None:
+        st.download_button(
+            "📄 PDF 저장",
+            data=pdf_bytes,
+            file_name="CVR보고서_{0}_{1}.pdf".format(site_name, datetime.now().strftime("%Y%m%d_%H%M%S")),
+            mime="application/pdf",
+        )
+    else:
+        st.button("📄 PDF 저장", disabled=True)
+        st.error("PDF 생성 실패: {0}".format(pdf_error if pdf_error else "알 수 없는 오류"))
